@@ -1,6 +1,6 @@
 # app.py
 # MilkCrate (Beatport) — Streamlit app
-# - Robust, package-free imports (no importlib file-location hacks)
+# - Robust imports (no importlib file-location hacks)
 # - Loads model from local file OR downloads from a provided URL
 # - Classifies uploaded audio files and can export organized ZIP
 # - Uses @st.cache_resource to keep deploys snappy on Streamlit Cloud
@@ -49,7 +49,7 @@ DEFAULT_MODEL_URL = os.environ.get(
 
 # If your model expects a specific sample rate / duration for features:
 TARGET_SR = 22050
-MAX_DURATION_S = 60  # cap analysis to first N seconds to speed up
+DEFAULT_MAX_DURATION_S = 60  # cap analysis to first N seconds to speed up
 
 
 # ---------------------------
@@ -109,7 +109,7 @@ def load_model(model_path: pathlib.Path, fallback_url: Optional[str]) -> object:
 def load_audio_bytes_to_mono(
     data: bytes,
     sr: int = TARGET_SR,
-    max_duration_s: int = MAX_DURATION_S
+    max_duration_s: int = DEFAULT_MAX_DURATION_S
 ) -> np.ndarray:
     if librosa is None:
         raise RuntimeError(
@@ -143,8 +143,8 @@ def extract_features(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
 # Inference
 # ---------------------------
 
-def predict_one(model: object, filename: str, raw_bytes: bytes) -> Prediction:
-    y = load_audio_bytes_to_mono(raw_bytes, sr=TARGET_SR, max_duration_s=MAX_DURATION_S)
+def predict_one(model: object, filename: str, raw_bytes: bytes, duration_s: int) -> Prediction:
+    y = load_audio_bytes_to_mono(raw_bytes, sr=TARGET_SR, max_duration_s=duration_s)
     X = extract_features(y, sr=TARGET_SR)
 
     # Try scikit-learn API: predict_proba if available
@@ -184,7 +184,7 @@ def _label_from_model(model: object, idx: int) -> str:
 # Streamlit UI
 # ---------------------------
 
-def sidebar_controls() -> Tuple[pathlib.Path, Optional[str], bool]:
+def sidebar_controls() -> Tuple[pathlib.Path, Optional[str], bool, int]:
     st.sidebar.header("⚙️ Settings")
 
     model_path_str = st.sidebar.text_input(
@@ -200,14 +200,19 @@ def sidebar_controls() -> Tuple[pathlib.Path, Optional[str], bool]:
     if model_url == "":
         model_url = None
 
+    duration_s = st.sidebar.number_input(
+        "Analyze up to first N seconds",
+        min_value=5, max_value=300, value=DEFAULT_MAX_DURATION_S, step=5
+    )
+
     debug = st.sidebar.toggle("Debug mode", value=False, help="Show repository root contents and env info.")
-    return model_path, model_url, debug
+    return model_path, model_url, debug, int(duration_s)
 
 def main():
     st.title("🍼 MilkCrate — Beatport Classifier")
     st.caption("Organize your music by genres/sub-genres using your ML model.")
 
-    model_path, model_url, debug = sidebar_controls()
+    model_path, model_url, debug, duration_s = sidebar_controls()
 
     if debug:
         st.write("**Repo root**:", str(ROOT))
@@ -228,11 +233,7 @@ def main():
         accept_multiple_files=True
     )
 
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        limit = st.number_input("Analyze up to first N seconds", min_value=5, max_value=300, value=MAX_DURATION_S, step=5)
-    with col_b:
-        organize_zip = st.checkbox("Create ZIP organized by predicted genres", value=False)
+    organize_zip = st.checkbox("Create ZIP organized by predicted genres", value=False)
 
     results: List[Prediction] = []
 
@@ -241,14 +242,11 @@ def main():
         progress = st.progress(0.0)
         tmp_for_zip = pathlib.Path(st.session_state.get("_mc_tmp_dir", str(ROOT / ".tmp_uploads")))
         tmp_for_zip.mkdir(parents=True, exist_ok=True)
-        # update the global limit for this run
-        global MAX_DURATION_S
-        MAX_DURATION_S = int(limit)
 
         for i, f in enumerate(files, start=1):
             data = f.read()
             try:
-                pred = predict_one(model, f.name, data)
+                pred = predict_one(model, f.name, data, duration_s=duration_s)
                 results.append(pred)
             except Exception as e:
                 st.error(f"Failed to process `{f.name}`: {e}")
