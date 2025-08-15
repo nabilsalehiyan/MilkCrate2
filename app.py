@@ -1,60 +1,41 @@
+from __future__ import annotations
+
 import os
-import io
-import tempfile
 import glob
-import warnings
-from typing import Optional, Tuple, List
+import tempfile
+from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
+import joblib
+import requests
 import streamlit as st
 
-# Optional deps used when available
+# Optional: only used if a raw xgboost Booster is provided
 try:
-    import joblib
+    import xgboost as xgb  # type: ignore
 except Exception:  # pragma: no cover
-    joblib = None
-
-try:
-    import xgboost as xgb
-except Exception:  # pragma: no cover
-    xgb = None
+    xgb = None  # type: ignore
 
 try:
     import librosa
-except Exception:  # pragma: no cover
-    librosa = None
-
-try:
-    import requests
 except Exception:
-    requests = None
+    st.error("librosa is required. Add 'librosa' to requirements.txt and redeploy.")
+    raise
 
-# =============================
-# Config & Constants
-# =============================
-APP_TITLE = "MilkCrate – DJ Genre Classifier"
-MODELS_DIR = "models"
-DEFAULT_MODEL_FILENAME = "model_version3beatport.joblib"  # <— matches the file you committed (~3.8MB)
-DEFAULT_LABEL_ENCODER = "label_encoder.pkl"
+APP_NAME = "MilkCrate – Genre Classifier"
+MODELS_DIR = Path("models")
+DEFAULT_MODEL_FILENAME = "model_version3beatport.joblib"
+DEFAULT_ENCODER_FILENAME = "label_encoder.pkl"
 DEFAULT_SR = 22050
 
-# =============================
-# Utility: small helpers
-# =============================
 
-def ensure_models_dir() -> str:\n    os.makedirs(MODELS_DIR, exist_ok=True)
-    return MODELS_DIR
+def ensure_models_dir() -> str:
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    return str(MODELS_DIR)
 
 
-def list_models() -> List[str]:
-    ensure_models_dir()
-    files = []
-    for ext in ("*.joblib", "*.pkl", "*.json", "*.ubj", "*.bst"):
-        files.extend(sorted(glob.glob(os.path.join(MODELS_DIR, ext))))
-    return [os.path.basename(p) for p in files]
-
-
-def is_lfs_pointer(path: str) -> bool:
+def is_lfs_pointer(path: Path) -> bool:
     try:
         with open(path, "rb") as f:
             head = f.read(200)
@@ -63,14 +44,78 @@ def is_lfs_pointer(path: str) -> bool:
         return False
 
 
-# =============================
-# Feature Extraction (34 dims)
-# =============================
+@st.cache_data(show_spinner=False)
+def _download_bytes(url: str, timeout: int = 300) -> bytes:
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.content
 
-def extract_features_34(path: str, sr: int = DEFAULT_SR, seconds: Optional[float] = None) -> np.ndarray:
-    if librosa is None:
-        raise RuntimeError("librosa is required for feature extraction. Add 'librosa' to requirements.txt")
 
+def download_file(url: str, dest: Path) -> None:
+    data = _download_bytes(url)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as f:
+        f.write(data)
+
+
+@st.cache_resource(show_spinner=False)
+def load_model(model_filename: str, model_url: str = ""):
+    """
+    Load a scikit-learn/xgboost model from ./models or download from URL if missing.
+    """
+    ensure_models_dir()
+    model_path = MODELS_DIR / model_filename
+
+    if not model_path.exists():
+        if model_url:
+            with st.spinner("Downloading model from URL…"):
+                download_file(model_url, model_path)
+        else:
+            available = [Path(p).name for p in glob.glob(str(MODELS_DIR / "*"))]
+            raise FileNotFoundError(
+                f"Missing model at {model_path} and no URL provided. "
+                f"Found in ./models: {available}"
+            )
+
+    if is_lfs_pointer(model_path):
+        raise FileNotFoundError(
+            f"Model file at {model_path} appears to be a Git LFS pointer, not the real artifact."
+        )
+
+    # Support .joblib/.pkl via joblib; .json for raw Booster (optional)
+    if model_path.suffix.lower() in {".joblib", ".pkl"}:
+        return joblib.load(model_path)
+    elif model_path.suffix.lower() == ".json" and xgb is not None:
+        booster = xgb.Booster()
+        booster.load_model(str(model_path))
+        return booster
+    else:
+        # Fallback: try joblib anyway
+        return joblib.load(model_path)
+
+
+@st.cache_resource(show_spinner=False)
+def load_label_encoder(encoder_filename: str = DEFAULT_ENCODER_FILENAME):
+    path = MODELS_DIR / encoder_filename
+    if not path.exists():
+        return None
+    if is_lfs_pointer(path):
+        st.warning("Label encoder appears to be an LFS pointer; ignoring.")
+        return None
+    try:
+        return joblib.load(path)
+    except Exception:
+        return None
+
+
+def extract_features_34(
+    path: str,
+    sr: int = DEFAULT_SR,
+    seconds: Optional[float] = None,
+) -> np.ndarray:
+    """
+    34-D features: 13 MFCC means + 12 Chroma means + 7 Spectral contrast means + ZCR mean + Rolloff mean.
+    """
     y, sr = librosa.load(path, sr=sr, mono=True)
 
     if seconds is not None and seconds > 0:
@@ -79,259 +124,172 @@ def extract_features_34(path: str, sr: int = DEFAULT_SR, seconds: Optional[float
     n_fft = 2048
     hop = 512
 
-    # 13 MFCC means
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, n_fft=n_fft, hop_length=hop).mean(axis=1)
-    # 12 chroma means
-    chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean(axis=1)
-    # 7 spectral contrast means
-    contrast = librosa.feature.spectral_contrast(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean(axis=1)
-    # 1 zero-crossing rate mean
-    zcr = librosa.feature.zero_crossing_rate(y=y, hop_length=hop).mean()
-    # 1 spectral rolloff mean
-    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean()
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, n_fft=n_fft, hop_length=hop).mean(axis=1)  # 13
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean(axis=1)    # 12
+    contrast = librosa.feature.spectral_contrast(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean(axis=1)  # 7
+    zcr = librosa.feature.zero_crossing_rate(y=y, hop_length=hop).mean()                           # 1
+    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean()     # 1
 
-    feat = np.hstack([mfcc, chroma, contrast, [zcr], [rolloff]])
+    feat = np.hstack([mfcc, chroma, contrast, [zcr], [rolloff]])  # -> (34,)
     if feat.shape[0] != 34:
-        raise ValueError(f"Feature length {feat.shape[0]} != 34 — check extractor")
+        raise ValueError(f"Feature shape mismatch at extraction time: expected 34, got {feat.shape[0]}")
     return feat.astype(np.float32)
 
 
-# =============================
-# Loading: Label Encoder
-# =============================
-@st.cache_resource(show_spinner=False)
-def load_label_encoder(le_filename: str = DEFAULT_LABEL_ENCODER):
-    ensure_models_dir()
-    path = os.path.join(MODELS_DIR, le_filename)
-    if not os.path.exists(path):
-        st.warning(f"Label encoder '{le_filename}' not found in ./{MODELS_DIR}. Class names will be numeric.")
-        return None
-    if is_lfs_pointer(path):
-        st.error(f"'{le_filename}' looks like a Git LFS pointer. Commit real file or load from URL.")
-        st.stop()
-    if joblib is None:
-        raise RuntimeError("joblib is required. Add 'joblib' to requirements.txt")
-    return joblib.load(path)
-
-
-# =============================
-# Loading: Model
-# =============================
-
-def _load_model_any(path: str):
-    """Try joblib/pickle first. If that fails and XGBoost is available,
-    try loading Booster formats (.json/.ubj/.bst). Returns a model-like object.
+def predict_label(model, X: np.ndarray, label_encoder=None) -> Tuple[str, Optional[np.ndarray]]:
     """
-    if is_lfs_pointer(path):
-        raise FileNotFoundError(
-            f"'{os.path.basename(path)}' is a Git LFS pointer, not the real model. Replace with real file or use a URL."
-        )
-
-    # 1) joblib/pickle path
-    if joblib is not None:
-        try:
-            return joblib.load(path)
-        except Exception as e:
-            # fall through to possible XGBoost booster
-            last = e
-    else:
-        last = RuntimeError("joblib not installed")
-
-    # 2) Native XGBoost Booster
-    if xgb is not None and os.path.splitext(path)[1].lower() in {".json", ".ubj", ".bst"}:
-        try:
-            booster = xgb.Booster()
-            booster.load_model(path)
-            return booster
-        except Exception as e:
-            last = e
-
-    raise RuntimeError(f"Could not load model from {path}: {last}")
-
-
-@st.cache_resource(show_spinner=True)
-def load_model(model_filename: str, model_url: Optional[str] = None):
-    ensure_models_dir()
-    local_path = os.path.join(MODELS_DIR, model_filename)
-
-    if os.path.exists(local_path):
-        return _load_model_any(local_path)
-
-    if not model_url:
-        # match previous behavior but give actionable info in UI
-        raise FileNotFoundError(
-            f"Missing model at\n\n{local_path}\n\nProvide a valid file in './{MODELS_DIR}' or a download URL in the sidebar."
-        )
-
-    if requests is None:
-        raise RuntimeError("'requests' is required to download a model from URL. Add it to requirements.txt.")
-
-    # Download to models dir
-    with st.spinner("Downloading model..."):
-        r = requests.get(model_url, timeout=300)
-        r.raise_for_status()
-        with open(local_path, "wb") as f:
-            f.write(r.content)
-    return _load_model_any(local_path)
-
-
-# =============================
-# Prediction helpers
-# =============================
-
-def predict_with_model(model, X: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Returns (pred_indices, proba_or_none). Handles sklearn & xgboost.Booster."""
-    # Ensure 2D
-    if X.ndim == 1:
-        X = X[np.newaxis, :]
-
-    # Guard against feature mismatch when possible
-    expected = getattr(model, "n_features_in_", None)
-    if expected is not None and X.shape[1] != expected:
-        raise ValueError(f"Feature shape mismatch, expected: {expected}, got {X.shape[1]}")
-
-    # sklearn-like (XGBClassifier via scikit API, etc.)
-    if hasattr(model, "predict"):
-        try:
-            y_pred = model.predict(X)
-            proba = model.predict_proba(X) if hasattr(model, "predict_proba") else None
-            return y_pred, proba
-        except Exception:
-            pass
-
-    # xgboost.Booster path
-    if xgb is not None and isinstance(model, getattr(xgb, "Booster", ())):
+    Return (label, proba_vector_optional).
+    Handles sklearn-style estimators and raw xgboost Booster.
+    """
+    # Raw xgboost Booster case
+    if xgb is not None and isinstance(model, xgb.Booster):
         dmat = xgb.DMatrix(X)
-        raw = model.predict(dmat)  # shape: (n, n_classes) for multi-class
-        if raw.ndim == 2:
-            idx = np.argmax(raw, axis=1)
-            return idx, raw
+        proba = model.predict(dmat)
+        if proba.ndim == 1:
+            y = (proba > 0.5).astype(int)
         else:
-            # binary case returns shape (n,)
-            idx = (raw > 0.5).astype(int)
-            proba = np.vstack([1 - raw, raw]).T
-            return idx, proba
-
-    # Fallback
-    raise RuntimeError("Unsupported model type for prediction.")
-
-
-# =============================
-# UI
-# =============================
-
-def main():
-    st.set_page_config(page_title=APP_TITLE, page_icon="🎛️", layout="centered")
-    st.title(APP_TITLE)
-    st.caption("Organize untagged music into genres / sub-genres with ML.")
-
-    with st.sidebar:
-        st.header("Settings")
-        st.write("**Model source**")
-        available = list_models()
-
-        model_filename = st.text_input(
-            "Model filename (in ./models)",
-            value=DEFAULT_MODEL_FILENAME if DEFAULT_MODEL_FILENAME in available or True else (available[0] if available else DEFAULT_MODEL_FILENAME),
-            help=f"Put the model file inside './{MODELS_DIR}' or provide a direct download URL below.",
-        )
-        model_url = st.text_input(
-            "Model URL (optional)",
-            value="",
-            help="If provided, the file will be downloaded to ./models when missing.",
-        ).strip() or None
-
-        label_filename = st.text_input(
-            "Label encoder filename (in ./models)",
-            value=DEFAULT_LABEL_ENCODER,
-        )
-
-        analyze_seconds = st.number_input(
-            "Analyze first N seconds (0 = full file)",
-            min_value=0, max_value=600, value=60, step=5,
-        )
-
-        st.divider()
-        with st.expander("Debug info"):
-            st.write({
-                "models_dir": MODELS_DIR,
-                "available_files": available,
-                "cwd": os.getcwd(),
-            })
-
-    # Load model & label encoder
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # hush xgboost pickle warnings
-            model = load_model(model_filename, model_url)
-    except FileNotFoundError as e:
-        st.error(str(e))
-        st.stop()
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-
-    label_encoder = load_label_encoder(label_filename)
-
-    st.subheader("Classify a track")
-    uploaded = st.file_uploader("Upload an audio file (mp3/wav/flac/m4a/ogg)", type=["mp3","wav","flac","m4a","ogg"], accept_multiple_files=False)
-
-    if uploaded is None:
-        st.info("Upload a file to start.")
-        return
-
-    # Persist upload to a temp file so librosa can read it
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded.name)[1]) as tmp:
-        tmp.write(uploaded.getbuffer())
-        tmp_path = tmp.name
-
-    st.write(f"**File:** {uploaded.name}")
-
-    try:
-        feat = extract_features_34(tmp_path, sr=DEFAULT_SR, seconds=analyze_seconds if analyze_seconds > 0 else None)
-        X = np.atleast_2d(feat)
-
-        # Preview feature shape and expected input
-        expected = getattr(model, "n_features_in_", None)
-        st.write({"runtime_feature_len": int(X.shape[1]), "model_n_features_in": int(expected) if expected is not None else None})
-
-        y_pred, proba = predict_with_model(model, X)
-        pred_idx = int(y_pred[0]) if hasattr(y_pred, "__len__") else int(y_pred)
-
+            y = np.argmax(proba, axis=1)
+        label_val = int(y[0])
         if label_encoder is not None and hasattr(label_encoder, "inverse_transform"):
             try:
-                label = label_encoder.inverse_transform([pred_idx])[0]
+                label_val = label_encoder.inverse_transform([label_val])[0]
             except Exception:
-                label = str(pred_idx)
-        else:
-            label = str(pred_idx)
+                pass
+        return str(label_val), proba[0] if isinstance(proba, np.ndarray) else None
 
-        st.success(f"Prediction: **{label}**")
+    # sklearn-like path
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        y = np.argmax(proba, axis=1)
+        label_idx = int(y[0])
+        label_val = label_idx
+        if label_encoder is not None and hasattr(label_encoder, "inverse_transform"):
+            try:
+                label_val = label_encoder.inverse_transform([label_idx])[0]
+            except Exception:
+                pass
+        return str(label_val), proba[0]
+    else:
+        y = model.predict(X)
+        label_val = y[0]
+        if isinstance(label_val, (np.floating, np.integer)):
+            label_val = int(label_val)
+        if label_encoder is not None and hasattr(label_encoder, "inverse_transform"):
+            try:
+                label_val = label_encoder.inverse_transform([int(label_val)])[0]
+            except Exception:
+                pass
+        return str(label_val), None
 
-        # Show top-k probabilities when available
-        if proba is not None and proba.ndim == 2:
-            probs = proba[0]
-            # Build a display of top classes
-            top_k = min(5, probs.shape[0])
-            order = np.argsort(probs)[::-1][:top_k]
-            top_rows = []
-            for i in order:
-                name = label_encoder.inverse_transform([i])[0] if (label_encoder is not None and hasattr(label_encoder, "inverse_transform")) else str(i)
-                top_rows.append((name, float(probs[i])))
-            st.write("Top classes:")
-            for name, p in top_rows:
-                st.write(f"• {name}: {p:.3f}")
 
-    except ValueError as ve:
-        # Common case: feature length mismatch
-        st.error(str(ve))
-    except Exception as e:
-        st.exception(e)
-    finally:
+def main() -> None:
+    st.set_page_config(page_title=APP_NAME, page_icon="🎧", layout="centered")
+    st.title(APP_NAME)
+    st.caption("Classify tracks by genre using your trained model.")
+
+    st.sidebar.header("Model settings")
+    model_filename = st.sidebar.text_input(
+        "Model filename (in ./models)",
+        value=DEFAULT_MODEL_FILENAME,
+        help="Place the model file inside the ./models folder.",
+    )
+    model_url = st.sidebar.text_input(
+        "Model URL (optional)",
+        value="",
+        help="If provided and the file is missing locally, it will be downloaded and cached.",
+    )
+    encoder_filename = st.sidebar.text_input(
+        "Label encoder filename (in ./models)",
+        value=DEFAULT_ENCODER_FILENAME,
+    )
+    seconds = st.sidebar.number_input(
+        "Analyze first N seconds (0 = full track)",
+        min_value=0,
+        max_value=600,
+        value=30,
+        step=5,
+        help="Use 0 to analyze the full file (slower).",
+    )
+    show_debug = st.sidebar.checkbox("Show debug info", value=False)
+
+    # Load model + encoder
+    try:
+        model = load_model(model_filename, model_url)
+    except FileNotFoundError as e:
+        st.error(str(e))
+        with st.expander("Files in ./models"):
+            files = sorted(Path("models").glob("*"))
+            if files:
+                for p in files:
+                    st.write(f"- {p.name} ({p.stat().st_size/1024:.1f} KB)")
+            else:
+                st.write("No files found.")
+        st.stop()
+
+    label_encoder = load_label_encoder(encoder_filename)
+
+    expected = getattr(model, "n_features_in_", None)
+    if show_debug:
+        st.sidebar.write(
+            {
+                "expected_n_features": int(expected) if expected is not None else None,
+                "model_type": type(model).__name__,
+                "cwd": os.getcwd(),
+            }
+        )
+
+    st.subheader("Upload audio")
+    uploads = st.file_uploader(
+        "Drop audio files here (mp3/wav/flac/ogg/m4a)",
+        type=["mp3", "wav", "flac", "ogg", "m4a"],
+        accept_multiple_files=True,
+    )
+
+    if not uploads:
+        st.info("Upload one or more audio files to classify.")
+        return
+
+    results = []
+    for up in uploads:
         try:
-            os.unlink(tmp_path)
+            # Save to a temp file so librosa can read it
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{up.name}") as tmp:
+                tmp.write(up.read())
+                tmp_path = tmp.name
+
+            feat = extract_features_34(tmp_path, sr=DEFAULT_SR, seconds=seconds if seconds > 0 else None)
+            X = np.atleast_2d(feat)
+
+            if expected is not None and X.shape[1] != int(expected):
+                st.error(f"Feature shape mismatch for {up.name}: expected {expected}, got {X.shape[1]}")
+                continue
+
+            label, proba = predict_label(model, X, label_encoder)
+
+            results.append((up.name, label, proba.max().item() if isinstance(proba, np.ndarray) else None))
+            st.success(
+                f"**{up.name}** → **{label}**"
+                + (f" (conf {proba.max():.2f})" if isinstance(proba, np.ndarray) else "")
+            )
+
+        except Exception as e:
+            st.error(f"Failed to process {up.name}: {e}")
+
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    if results:
+        st.subheader("Results")
+        try:
+            import pandas as pd  # optional
+            df = pd.DataFrame(results, columns=["file", "predicted_genre", "confidence"])
+            st.dataframe(df, use_container_width=True)
         except Exception:
-            pass
+            for fname, label, conf in results:
+                st.write(f"- {fname} → {label}" + (f" (conf {conf:.2f})" if conf is not None else ""))
 
 
 if __name__ == "__main__":
