@@ -8,3 +8,6 @@ venv/
 data/
 jamendo_download/
 jamendo_download/
+dataset1/
+cached_X.npy
+cached_y.npy
