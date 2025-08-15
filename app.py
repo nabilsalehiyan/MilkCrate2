@@ -25,8 +25,8 @@ except Exception:
 
 APP_NAME = "MilkCrate – Genre Classifier"
 MODELS_DIR = Path("models")
-DEFAULT_MODEL_FILENAME = "model_version3beatport.joblib"
-DEFAULT_ENCODER_FILENAME = "label_encoder.pkl"
+DEFAULT_MODEL_FILENAME = "model_version3beatport.joblib"  # what you committed (~3.8 MB)
+DEFAULT_ENCODER_FILENAME = "label_encoder.pkl"            # what you committed (~2.4 KB)
 DEFAULT_SR = 22050
 
 
@@ -228,6 +228,23 @@ def main() -> None:
 
     label_encoder = load_label_encoder(encoder_filename)
 
+    # ---- Show known genres/classes ----
+    with st.sidebar.expander("Known genres"):
+        classes = None
+        if label_encoder is not None and hasattr(label_encoder, "classes_"):
+            classes = [str(c) for c in label_encoder.classes_]
+        elif hasattr(model, "classes_"):
+            classes = [str(c) for c in getattr(model, "classes_")]
+        elif xgb is not None and isinstance(model, xgb.Booster):
+            st.info("Using a raw XGBoost Booster — class names aren’t stored. "
+                    "Add models/label_encoder.pkl to see genre names.")
+        if classes:
+            st.write(f"{len(classes)} classes")
+            st.write(classes)
+            st.download_button("Download class list", "\n".join(classes), "genres.txt")
+        else:
+            st.warning("No class names available. Make sure models/label_encoder.pkl is present.")
+
     expected = getattr(model, "n_features_in_", None)
     if show_debug:
         st.sidebar.write(
@@ -235,6 +252,8 @@ def main() -> None:
                 "expected_n_features": int(expected) if expected is not None else None,
                 "model_type": type(model).__name__,
                 "cwd": os.getcwd(),
+                "models_dir": ensure_models_dir(),
+                "available_models": [Path(p).name for p in glob.glob(str(MODELS_DIR / "*"))],
             }
         )
 
@@ -251,6 +270,7 @@ def main() -> None:
 
     results = []
     for up in uploads:
+        tmp_path = None
         try:
             # Save to a temp file so librosa can read it
             with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{up.name}") as tmp:
@@ -266,25 +286,38 @@ def main() -> None:
 
             label, proba = predict_label(model, X, label_encoder)
 
-            results.append((up.name, label, proba.max().item() if isinstance(proba, np.ndarray) else None))
-            st.success(
-                f"**{up.name}** → **{label}**"
-                + (f" (conf {proba.max():.2f})" if isinstance(proba, np.ndarray) else "")
-            )
+            # Show result
+            if isinstance(proba, np.ndarray):
+                conf = float(np.max(proba))
+                st.success(f"**{up.name}** → **{label}** (conf {conf:.2f})")
+            else:
+                conf = None
+                st.success(f"**{up.name}** → **{label}**")
+
+            # Optional: per-class probabilities (bar chart)
+            if isinstance(proba, np.ndarray) and label_encoder is not None and hasattr(label_encoder, "classes_"):
+                try:
+                    import pandas as pd
+                    st.bar_chart(pd.Series(proba, index=[str(c) for c in label_encoder.classes_]))
+                except Exception:
+                    pass
+
+            results.append((up.name, label, conf))
 
         except Exception as e:
             st.error(f"Failed to process {up.name}: {e}")
 
         finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     if results:
         st.subheader("Results")
         try:
-            import pandas as pd  # optional
+            import pandas as pd
             df = pd.DataFrame(results, columns=["file", "predicted_genre", "confidence"])
             st.dataframe(df, use_container_width=True)
         except Exception:
