@@ -27,6 +27,9 @@ try:
 except Exception as e:
     librosa = None
     _librosa_err = e
+# let Streamlit secrets populate env vars the app already reads
+os.environ.setdefault("MILKCRATE_MODEL_URL", st.secrets.get("MILKCRATE_MODEL_URL", ""))
+os.environ.setdefault("MILKCRATE_GH_TOKEN", st.secrets.get("MILKCRATE_GH_TOKEN", ""))
 
 # ---------------------------
 # Configuration
