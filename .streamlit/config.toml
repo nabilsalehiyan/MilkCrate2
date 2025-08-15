@@ -1,0 +1,2 @@
+[server]
+fileWatcherType = "none"   # stop inotify watcher that’s hanging
