@@ -12,3 +12,13 @@ dataset1/
 cached_X.npy
 cached_y.npy
 artifacts/
+
+.venv*/
+venv/
+env/
+__pycache__/
+*.pyc
+.DS_Store
+models/*.joblib
+
+!models/genre_classification_model_xgb.pkl
