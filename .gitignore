@@ -25,3 +25,7 @@ models/*.joblib
 
 # allow deployable model
 !models/model_version3beatport.joblib
+
+# allow Streamlit config
+!.streamlit/
+!.streamlit/config.toml
