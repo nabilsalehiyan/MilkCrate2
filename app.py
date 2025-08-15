@@ -1,306 +1,338 @@
-# app.py
-# MilkCrate (Beatport) — Streamlit app
-# - Robust imports (no importlib file-location hacks)
-# - Loads model from local file OR downloads from a provided URL
-# - Classifies uploaded audio files and can export organized ZIP
-# - Uses @st.cache_resource to keep deploys snappy on Streamlit Cloud
-
-from __future__ import annotations
-
-import io
 import os
-import zipfile
-import shutil
-import pathlib
-import urllib.request
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+import io
+import tempfile
+import glob
+import warnings
+from typing import Optional, Tuple, List
 
-import streamlit as st
 import numpy as np
-import pandas as pd
-import joblib
+import streamlit as st
 
-# Optional heavy imports wrapped so the app still boots with a friendly hint
+# Optional deps used when available
+try:
+    import joblib
+except Exception:  # pragma: no cover
+    joblib = None
+
+try:
+    import xgboost as xgb
+except Exception:  # pragma: no cover
+    xgb = None
+
 try:
     import librosa
-except Exception as e:
+except Exception:  # pragma: no cover
     librosa = None
-    _librosa_err = e
-# let Streamlit secrets populate env vars the app already reads
-os.environ.setdefault("MILKCRATE_MODEL_URL", st.secrets.get("MILKCRATE_MODEL_URL", ""))
-os.environ.setdefault("MILKCRATE_GH_TOKEN", st.secrets.get("MILKCRATE_GH_TOKEN", ""))
 
-# ---------------------------
-# Configuration
-# ---------------------------
+try:
+    import requests
+except Exception:
+    requests = None
 
-ROOT = pathlib.Path(__file__).parent.resolve()
-MODELS_DIR = ROOT / "models"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
+# =============================
+# Config & Constants
+# =============================
+APP_TITLE = "MilkCrate – DJ Genre Classifier"
+MODELS_DIR = "models"
+DEFAULT_MODEL_FILENAME = "model_version3beatport.joblib"  # <— matches the file you committed (~3.8MB)
+DEFAULT_LABEL_ENCODER = "label_encoder.pkl"
+DEFAULT_SR = 22050
 
-# Default model file & a placeholder URL (change this to your real Release URL)
-DEFAULT_MODEL_NAME = "model_version3beatport.joblib"
-DEFAULT_MODEL_PATH = MODELS_DIR / DEFAULT_MODEL_NAME
+# =============================
+# Utility: small helpers
+# =============================
 
-# You can set this as an env var on Streamlit Cloud (Secrets) or edit here.
-DEFAULT_MODEL_URL = os.environ.get(
-    "MILKCRATE_MODEL_URL",
-    # Replace this with your actual GitHub Release asset URL:
-    "https://github.com/nabilsalehiyan/milkcrate2/releases/download/v1/model_version3beatport.joblib"
-)
-
-# If your model expects a specific sample rate / duration for features:
-TARGET_SR = 22050
-DEFAULT_MAX_DURATION_S = 60  # cap analysis to first N seconds to speed up
+def ensure_models_dir() -> str:\n    os.makedirs(MODELS_DIR, exist_ok=True)
+    return MODELS_DIR
 
 
-# ---------------------------
-# UI helpers / Types
-# ---------------------------
-
-st.set_page_config(page_title="MilkCrate (Beatport Model)", page_icon="🍼", layout="wide")
-
-@dataclass
-class Prediction:
-    filename: str
-    label: str
-    confidence: float
+def list_models() -> List[str]:
+    ensure_models_dir()
+    files = []
+    for ext in ("*.joblib", "*.pkl", "*.json", "*.ubj", "*.bst"):
+        files.extend(sorted(glob.glob(os.path.join(MODELS_DIR, ext))))
+    return [os.path.basename(p) for p in files]
 
 
-# ---------------------------
-# Model loading
-# ---------------------------
+def is_lfs_pointer(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(200)
+        return b"git-lfs.github.com/spec" in head
+    except Exception:
+        return False
 
-def _download_file(url: str, dest: pathlib.Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
-        shutil.copyfileobj(r, f)
-    tmp.replace(dest)
+
+# =============================
+# Feature Extraction (34 dims)
+# =============================
+
+def extract_features_34(path: str, sr: int = DEFAULT_SR, seconds: Optional[float] = None) -> np.ndarray:
+    if librosa is None:
+        raise RuntimeError("librosa is required for feature extraction. Add 'librosa' to requirements.txt")
+
+    y, sr = librosa.load(path, sr=sr, mono=True)
+
+    if seconds is not None and seconds > 0:
+        y = y[: int(seconds * sr)]
+
+    n_fft = 2048
+    hop = 512
+
+    # 13 MFCC means
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, n_fft=n_fft, hop_length=hop).mean(axis=1)
+    # 12 chroma means
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean(axis=1)
+    # 7 spectral contrast means
+    contrast = librosa.feature.spectral_contrast(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean(axis=1)
+    # 1 zero-crossing rate mean
+    zcr = librosa.feature.zero_crossing_rate(y=y, hop_length=hop).mean()
+    # 1 spectral rolloff mean
+    rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, n_fft=n_fft, hop_length=hop).mean()
+
+    feat = np.hstack([mfcc, chroma, contrast, [zcr], [rolloff]])
+    if feat.shape[0] != 34:
+        raise ValueError(f"Feature length {feat.shape[0]} != 34 — check extractor")
+    return feat.astype(np.float32)
+
+
+# =============================
+# Loading: Label Encoder
+# =============================
+@st.cache_resource(show_spinner=False)
+def load_label_encoder(le_filename: str = DEFAULT_LABEL_ENCODER):
+    ensure_models_dir()
+    path = os.path.join(MODELS_DIR, le_filename)
+    if not os.path.exists(path):
+        st.warning(f"Label encoder '{le_filename}' not found in ./{MODELS_DIR}. Class names will be numeric.")
+        return None
+    if is_lfs_pointer(path):
+        st.error(f"'{le_filename}' looks like a Git LFS pointer. Commit real file or load from URL.")
+        st.stop()
+    if joblib is None:
+        raise RuntimeError("joblib is required. Add 'joblib' to requirements.txt")
+    return joblib.load(path)
+
+
+# =============================
+# Loading: Model
+# =============================
+
+def _load_model_any(path: str):
+    """Try joblib/pickle first. If that fails and XGBoost is available,
+    try loading Booster formats (.json/.ubj/.bst). Returns a model-like object.
+    """
+    if is_lfs_pointer(path):
+        raise FileNotFoundError(
+            f"'{os.path.basename(path)}' is a Git LFS pointer, not the real model. Replace with real file or use a URL."
+        )
+
+    # 1) joblib/pickle path
+    if joblib is not None:
+        try:
+            return joblib.load(path)
+        except Exception as e:
+            # fall through to possible XGBoost booster
+            last = e
+    else:
+        last = RuntimeError("joblib not installed")
+
+    # 2) Native XGBoost Booster
+    if xgb is not None and os.path.splitext(path)[1].lower() in {".json", ".ubj", ".bst"}:
+        try:
+            booster = xgb.Booster()
+            booster.load_model(path)
+            return booster
+        except Exception as e:
+            last = e
+
+    raise RuntimeError(f"Could not load model from {path}: {last}")
+
 
 @st.cache_resource(show_spinner=True)
-def load_model(model_path: pathlib.Path, fallback_url: Optional[str]) -> object:
-    """
-    Loads a joblib model. If not present and a URL is provided, downloads it.
-    """
-    if not model_path.exists():
-        if fallback_url:
-            st.info(f"Model not found at `{model_path}` — attempting download…")
-            try:
-                _download_file(fallback_url, model_path)
-            except Exception as e:
-                st.error(
-                    "Couldn't download the model. "
-                    "Set MILKCRATE_MODEL_URL in environment/secrets or place the file locally."
-                )
-                raise
-        else:
-            raise FileNotFoundError(f"Missing model at {model_path} and no URL provided.")
-    try:
-        model = joblib.load(model_path)
-    except Exception as e:
-        st.error(f"Failed to load model from {model_path} — is it a valid joblib file?")
-        raise
-    return model
+def load_model(model_filename: str, model_url: Optional[str] = None):
+    ensure_models_dir()
+    local_path = os.path.join(MODELS_DIR, model_filename)
 
+    if os.path.exists(local_path):
+        return _load_model_any(local_path)
 
-# ---------------------------
-# Feature extraction
-# ---------------------------
-
-def load_audio_bytes_to_mono(
-    data: bytes,
-    sr: int = TARGET_SR,
-    max_duration_s: int = DEFAULT_MAX_DURATION_S
-) -> np.ndarray:
-    if librosa is None:
-        raise RuntimeError(
-            "librosa is not available. Add 'librosa' and 'soundfile' to requirements.txt "
-            f"(import error: {_librosa_err})"
+    if not model_url:
+        # match previous behavior but give actionable info in UI
+        raise FileNotFoundError(
+            f"Missing model at\n\n{local_path}\n\nProvide a valid file in './{MODELS_DIR}' or a download URL in the sidebar."
         )
-    # librosa.load accepts file-like via soundfile backend
-    with io.BytesIO(data) as bio:
-        y, _ = librosa.load(bio, sr=sr, mono=True, duration=max_duration_s)
-    return y
 
-def extract_features(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
-    """
-    Adjust to match the features your model was trained on.
-    Here: log-mel spectrogram summary (means + stds).
-    """
-    if librosa is None:
-        raise RuntimeError("librosa not available for feature extraction.")
-    # Log-mel
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64)
-    S_db = librosa.power_to_db(S + 1e-10)
-    # Summaries (mean & std over time) -> shape (2 * n_mels,)
-    feat_mean = S_db.mean(axis=1)
-    feat_std = S_db.std(axis=1)
-    feat = np.concatenate([feat_mean, feat_std], axis=0).astype(np.float32)
-    # Reshape to (1, n_features) for scikit-learn style models
-    return feat.reshape(1, -1)
+    if requests is None:
+        raise RuntimeError("'requests' is required to download a model from URL. Add it to requirements.txt.")
+
+    # Download to models dir
+    with st.spinner("Downloading model..."):
+        r = requests.get(model_url, timeout=300)
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+    return _load_model_any(local_path)
 
 
-# ---------------------------
-# Inference
-# ---------------------------
+# =============================
+# Prediction helpers
+# =============================
 
-def predict_one(model: object, filename: str, raw_bytes: bytes, duration_s: int) -> Prediction:
-    y = load_audio_bytes_to_mono(raw_bytes, sr=TARGET_SR, max_duration_s=duration_s)
-    X = extract_features(y, sr=TARGET_SR)
+def predict_with_model(model, X: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Returns (pred_indices, proba_or_none). Handles sklearn & xgboost.Booster."""
+    # Ensure 2D
+    if X.ndim == 1:
+        X = X[np.newaxis, :]
 
-    # Try scikit-learn API: predict_proba if available
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X)[0]
-        idx = int(np.argmax(proba))
-        label = _label_from_model(model, idx)
-        conf = float(proba[idx])
-    else:
-        # Fallback to predict only
-        pred = model.predict(X)
-        # pred might be index or label depending on how it was saved
-        if isinstance(pred[0], (int, np.integer)):
-            label = _label_from_model(model, int(pred[0]))
-        else:
-            label = str(pred[0])
-        conf = 1.0  # unknown
+    # Guard against feature mismatch when possible
+    expected = getattr(model, "n_features_in_", None)
+    if expected is not None and X.shape[1] != expected:
+        raise ValueError(f"Feature shape mismatch, expected: {expected}, got {X.shape[1]}")
 
-    return Prediction(filename=filename, label=label, confidence=conf)
-
-def _label_from_model(model: object, idx: int) -> str:
-    """
-    Resolve a human-readable label from the model. Adjust to your training pipeline.
-    Commonly stored as model.classes_ in sklearn classifiers.
-    """
-    if hasattr(model, "classes_"):
-        classes = getattr(model, "classes_")
+    # sklearn-like (XGBClassifier via scikit API, etc.)
+    if hasattr(model, "predict"):
         try:
-            return str(classes[idx])
+            y_pred = model.predict(X)
+            proba = model.predict_proba(X) if hasattr(model, "predict_proba") else None
+            return y_pred, proba
         except Exception:
             pass
-    # Fallback: just return index
-    return f"class_{idx}"
+
+    # xgboost.Booster path
+    if xgb is not None and isinstance(model, getattr(xgb, "Booster", ())):
+        dmat = xgb.DMatrix(X)
+        raw = model.predict(dmat)  # shape: (n, n_classes) for multi-class
+        if raw.ndim == 2:
+            idx = np.argmax(raw, axis=1)
+            return idx, raw
+        else:
+            # binary case returns shape (n,)
+            idx = (raw > 0.5).astype(int)
+            proba = np.vstack([1 - raw, raw]).T
+            return idx, proba
+
+    # Fallback
+    raise RuntimeError("Unsupported model type for prediction.")
 
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-
-def sidebar_controls() -> Tuple[pathlib.Path, Optional[str], bool, int]:
-    st.sidebar.header("⚙️ Settings")
-
-    model_path_str = st.sidebar.text_input(
-        "Model filename (in ./models)",
-        value=str(DEFAULT_MODEL_PATH.name)
-    )
-    model_path = (MODELS_DIR / model_path_str).resolve()
-
-    model_url = st.sidebar.text_input(
-        "Model URL (optional; used if file is missing)",
-        value=str(DEFAULT_MODEL_URL or "")
-    ).strip()
-    if model_url == "":
-        model_url = None
-
-    duration_s = st.sidebar.number_input(
-        "Analyze up to first N seconds",
-        min_value=5, max_value=300, value=DEFAULT_MAX_DURATION_S, step=5
-    )
-
-    debug = st.sidebar.toggle("Debug mode", value=False, help="Show repository root contents and env info.")
-    return model_path, model_url, debug, int(duration_s)
+# =============================
+# UI
+# =============================
 
 def main():
-    st.title("🍼 MilkCrate — Beatport Classifier")
-    st.caption("Organize your music by genres/sub-genres using your ML model.")
+    st.set_page_config(page_title=APP_TITLE, page_icon="🎛️", layout="centered")
+    st.title(APP_TITLE)
+    st.caption("Organize untagged music into genres / sub-genres with ML.")
 
-    model_path, model_url, debug, duration_s = sidebar_controls()
+    with st.sidebar:
+        st.header("Settings")
+        st.write("**Model source**")
+        available = list_models()
 
-    if debug:
-        st.write("**Repo root**:", str(ROOT))
-        st.write("**Root entries**:", [p.name for p in ROOT.iterdir()])
-        st.write("**Models dir**:", str(MODELS_DIR))
-        st.write("**Env MILKCRATE_MODEL_URL**:", os.environ.get("MILKCRATE_MODEL_URL"))
-
-    # Load model (cached)
-    with st.spinner("Loading model…"):
-        model = load_model(model_path, model_url)
-
-    st.success(f"Model loaded: `{model_path.name}`")
-
-    st.subheader("1) Upload audio files")
-    files = st.file_uploader(
-        "Drag & drop or browse",
-        type=["mp3", "wav", "flac", "ogg", "m4a", "aac"],
-        accept_multiple_files=True
-    )
-
-    organize_zip = st.checkbox("Create ZIP organized by predicted genres", value=False)
-
-    results: List[Prediction] = []
-
-    if files:
-        st.subheader("2) Results")
-        progress = st.progress(0.0)
-        tmp_for_zip = pathlib.Path(st.session_state.get("_mc_tmp_dir", str(ROOT / ".tmp_uploads")))
-        tmp_for_zip.mkdir(parents=True, exist_ok=True)
-
-        for i, f in enumerate(files, start=1):
-            data = f.read()
-            try:
-                pred = predict_one(model, f.name, data, duration_s=duration_s)
-                results.append(pred)
-            except Exception as e:
-                st.error(f"Failed to process `{f.name}`: {e}")
-            finally:
-                # store the raw file if we might need to zip later
-                if organize_zip:
-                    out = tmp_for_zip / f.name
-                    with open(out, "wb") as w:
-                        w.write(data)
-
-            progress.progress(i / len(files))
-
-        if results:
-            df = pd.DataFrame([{"file": r.filename, "predicted_genre": r.label, "confidence": r.confidence} for r in results])
-            st.dataframe(df, use_container_width=True)
-
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download results CSV", csv, "milkcrate_predictions.csv", "text/csv")
-
-            if organize_zip:
-                # Build a ZIP with subfolders per predicted label
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                    for r in results:
-                        src = tmp_for_zip / r.filename
-                        if not src.exists():
-                            continue
-                        arcname = f"{r.label}/{r.filename}"
-                        z.write(src, arcname)
-                zip_buf.seek(0)
-                st.download_button("Download organized ZIP", zip_buf, "milkcrate_organized.zip", "application/zip")
-
-                # cleanup temp files
-                try:
-                    shutil.rmtree(tmp_for_zip, ignore_errors=True)
-                except Exception:
-                    pass
-
-        else:
-            st.info("No predictions produced yet. Upload supported audio files to begin.")
-
-    st.divider()
-    with st.expander("Having trouble?"):
-        st.markdown(
-            """
-- Ensure your model file is present at `./models/` or set a **Model URL** in the sidebar.
-- If you trained with different features than the default log-mel summary, update `extract_features(...)` accordingly.
-- To speed up first-time loads, host the model on GitHub Releases and provide the asset URL via `MILKCRATE_MODEL_URL`.
-- Debug mode (sidebar) shows what files the app can actually see in Streamlit Cloud.
-            """
+        model_filename = st.text_input(
+            "Model filename (in ./models)",
+            value=DEFAULT_MODEL_FILENAME if DEFAULT_MODEL_FILENAME in available or True else (available[0] if available else DEFAULT_MODEL_FILENAME),
+            help=f"Put the model file inside './{MODELS_DIR}' or provide a direct download URL below.",
         )
+        model_url = st.text_input(
+            "Model URL (optional)",
+            value="",
+            help="If provided, the file will be downloaded to ./models when missing.",
+        ).strip() or None
+
+        label_filename = st.text_input(
+            "Label encoder filename (in ./models)",
+            value=DEFAULT_LABEL_ENCODER,
+        )
+
+        analyze_seconds = st.number_input(
+            "Analyze first N seconds (0 = full file)",
+            min_value=0, max_value=600, value=60, step=5,
+        )
+
+        st.divider()
+        with st.expander("Debug info"):
+            st.write({
+                "models_dir": MODELS_DIR,
+                "available_files": available,
+                "cwd": os.getcwd(),
+            })
+
+    # Load model & label encoder
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # hush xgboost pickle warnings
+            model = load_model(model_filename, model_url)
+    except FileNotFoundError as e:
+        st.error(str(e))
+        st.stop()
+    except Exception as e:
+        st.exception(e)
+        st.stop()
+
+    label_encoder = load_label_encoder(label_filename)
+
+    st.subheader("Classify a track")
+    uploaded = st.file_uploader("Upload an audio file (mp3/wav/flac/m4a/ogg)", type=["mp3","wav","flac","m4a","ogg"], accept_multiple_files=False)
+
+    if uploaded is None:
+        st.info("Upload a file to start.")
+        return
+
+    # Persist upload to a temp file so librosa can read it
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded.name)[1]) as tmp:
+        tmp.write(uploaded.getbuffer())
+        tmp_path = tmp.name
+
+    st.write(f"**File:** {uploaded.name}")
+
+    try:
+        feat = extract_features_34(tmp_path, sr=DEFAULT_SR, seconds=analyze_seconds if analyze_seconds > 0 else None)
+        X = np.atleast_2d(feat)
+
+        # Preview feature shape and expected input
+        expected = getattr(model, "n_features_in_", None)
+        st.write({"runtime_feature_len": int(X.shape[1]), "model_n_features_in": int(expected) if expected is not None else None})
+
+        y_pred, proba = predict_with_model(model, X)
+        pred_idx = int(y_pred[0]) if hasattr(y_pred, "__len__") else int(y_pred)
+
+        if label_encoder is not None and hasattr(label_encoder, "inverse_transform"):
+            try:
+                label = label_encoder.inverse_transform([pred_idx])[0]
+            except Exception:
+                label = str(pred_idx)
+        else:
+            label = str(pred_idx)
+
+        st.success(f"Prediction: **{label}**")
+
+        # Show top-k probabilities when available
+        if proba is not None and proba.ndim == 2:
+            probs = proba[0]
+            # Build a display of top classes
+            top_k = min(5, probs.shape[0])
+            order = np.argsort(probs)[::-1][:top_k]
+            top_rows = []
+            for i in order:
+                name = label_encoder.inverse_transform([i])[0] if (label_encoder is not None and hasattr(label_encoder, "inverse_transform")) else str(i)
+                top_rows.append((name, float(probs[i])))
+            st.write("Top classes:")
+            for name, p in top_rows:
+                st.write(f"• {name}: {p:.3f}")
+
+    except ValueError as ve:
+        # Common case: feature length mismatch
+        st.error(str(ve))
+    except Exception as e:
+        st.exception(e)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()
