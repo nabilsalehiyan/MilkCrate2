@@ -1,0 +1,21 @@
+# /Users/nabilsalehiyan/MilkCrate/scripts/predict_csv.py
+import os, argparse, pandas as pd
+from milkcrate.inference_tabular import predict_file
+
+def parse_args():
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    p = argparse.ArgumentParser("Batch predict classes for a CSV")
+    p.add_argument("--in_csv", default=os.path.join(repo, "data", "beatport_201611", "beatsdataset_full.csv"))
+    p.add_argument("--out_csv", default=os.path.join(repo, "data", "beatport_201611", "predictions.csv"))
+    return p.parse_args()
+
+def main():
+    a = parse_args()
+    out = predict_file(a.in_csv, a.out_csv)
+    print(f"[INFO] Wrote predictions → {out}")
+    # show a tiny preview
+    df = pd.read_csv(out, nrows=5)
+    print(df.head())
+
+if __name__ == "__main__":
+    main()

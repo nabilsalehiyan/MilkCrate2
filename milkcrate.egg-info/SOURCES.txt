@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+milkcrate/__init__.py
+milkcrate/app.py
+milkcrate/inference_tabular.py
+milkcrate/predict.py
+milkcrate.egg-info/PKG-INFO
+milkcrate.egg-info/SOURCES.txt
+milkcrate.egg-info/dependency_links.txt
+milkcrate.egg-info/requires.txt
+milkcrate.egg-info/top_level.txt

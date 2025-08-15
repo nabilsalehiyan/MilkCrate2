@@ -1,0 +1,49 @@
+# /Users/nabilsalehiyan/MilkCrate/milkcrate/inference_tabular.py
+import os, json
+import numpy as np, pandas as pd
+from joblib import load
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ARTS = os.path.join(REPO, "artifacts")
+
+_model = None
+_le = None
+_feats = None
+
+def _lazy_load():
+    global _model, _le, _feats
+    if _model is None:
+        _model = load(os.path.join(ARTS, "beatport201611_rf.joblib"))
+        _le    = load(os.path.join(ARTS, "beatport201611_label_encoder.joblib"))
+        _feats = json.load(open(os.path.join(ARTS, "beatport201611_feature_columns.json")))
+    return _model, _le, _feats
+
+def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+def predict_dataframe(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Return df with predicted_class and (if available) predicted_proba_top1."""
+    model, le, feats = _lazy_load()
+    df = _normalize_headers(df_in)
+    # Align features; ignore non-feature cols (e.g., class/id/unnamed: 0)
+    for col in feats:
+        if col not in df.columns:
+            df[col] = np.nan
+    X = df[feats]
+    # model pipeline includes imputer
+    y_idx = model.predict(X)
+    out = df_in.copy()
+    out["predicted_class"] = le.inverse_transform(y_idx)
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        top1 = proba.max(axis=1)
+        out["predicted_proba_top1"] = top1
+    return out
+
+def predict_file(in_csv_path: str, out_csv_path: str) -> str:
+    df = pd.read_csv(in_csv_path)
+    out = predict_dataframe(df)
+    out.to_csv(out_csv_path, index=False)
+    return out_csv_path
