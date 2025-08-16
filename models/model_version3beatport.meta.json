@@ -1,0 +1,5 @@
+{
+  "dataset": "beatport",
+  "dataset_version": "v3",
+  "num_classes": 23
+}
