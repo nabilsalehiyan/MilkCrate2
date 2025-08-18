@@ -1,11 +1,17 @@
 # app.py — MilkCrate (audio/video files → genre folders → ZIP)
 # Build: 2025-08-18-audio-only
 # - Accepts audio (wav, mp3, flac, ogg, opus, m4a, aac, wma, aiff, aif, aifc)
-# - Accepts video containers (mp4, m4v, mov, webm, mkv) and extracts audio
+# - Accepts video (mp4, m4v, mov, webm, mkv) and extracts audio
 # - Extracts features with librosa; predicts with sklearn model + LabelEncoder
-# - Groups ORIGINAL uploads into folders by predicted genre; lets you download a ZIP
+# - Groups ORIGINAL uploads into folders by predicted genre; offers ZIP download
 
-import os, io, re, zipfile, unicodedata, warnings, tempfile
+import io
+import os
+import re
+import zipfile
+import unicodedata
+import warnings
+import tempfile
 from typing import Dict, List, Tuple
 
 import joblib
@@ -13,25 +19,25 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# audio/decoding
-import soundfile as sf          # libsndfile decoder (wav/flac/ogg/aiff)
-import librosa                  # decoding + features (uses audioread/ffmpeg)
-import audioread                # backend for mp3/m4a/etc
+# decoding / features
+import soundfile as sf              # libsndfile (wav/flac/ogg/aiff)
+import librosa                      # decoding + features (uses audioread/ffmpeg)
+import audioread                    # backend for mp3/m4a/etc
 from moviepy.editor import AudioFileClip  # fallback for video containers
 
 warnings.filterwarnings("ignore")
 
-# --------- Config (can be changed in the sidebar) ---------
-DEFAULT_MODEL_PATH = "artifacts/beatport201611_hgb.joblib"   # ~46MB, committed
+# --------- Config (changeable in sidebar) ---------
+DEFAULT_MODEL_PATH = "artifacts/beatport201611_hgb.joblib"   # ~46MB, committed to repo
 DEFAULT_ENCODER_PATH = "artifacts/label_encoder.joblib"      # 23-class encoder
 TARGET_SR_DEFAULT = 22050
 MAX_ANALYZE_SECONDS_DEFAULT = 120
 TOP_K_DEFAULT = 5
 
 SUPPORTED_AUDIO = {
-    "wav","mp3","flac","ogg","oga","opus","m4a","aac","wma","aiff","aif","aifc"
+    "wav", "mp3", "flac", "ogg", "oga", "opus", "m4a", "aac", "wma", "aiff", "aif", "aifc"
 }
-SUPPORTED_VIDEO = {"mp4","m4v","mov","webm","mkv"}
+SUPPORTED_VIDEO = {"mp4", "m4v", "mov", "webm", "mkv"}
 
 st.set_page_config(page_title="MilkCrate • Audio → Genre ZIP", layout="wide")
 
@@ -52,9 +58,9 @@ def load_encoder(path: str):
 
 # --------- Utils ---------
 def sanitize_filename(name: str) -> str:
-    base = os.path.basename(name)
-    base = unicodedata.normalize("NFKD", base).encode("ascii","ignore").decode("ascii")
-    base = re.sub(r"[^\w\-.]+","_", base).strip("._")
+    base = os.path.basename(name or "audio")
+    base = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^\w\-.]+", "_", base).strip("._")
     return base or "audio"
 
 def align_columns_to_model(X: pd.DataFrame, model):
@@ -80,12 +86,12 @@ def get_display_names(model, encoder):
     return arr, arr
 
 # --------- Feature extraction ---------
-def extract_features_array(y: np.ndarray, sr: int) -> Dict[str,float]:
-    feats: Dict[str,float] = {}
+def extract_features_array(y: np.ndarray, sr: int) -> Dict[str, float]:
+    feats: Dict[str, float] = {}
     if y is None or len(y) == 0:
         return feats
 
-    feats["duration_s"] = float(len(y)/sr)
+    feats["duration_s"] = float(len(y) / sr)
 
     # Time-domain
     rms = librosa.feature.rms(y=y)
@@ -144,8 +150,8 @@ def extract_features_array(y: np.ndarray, sr: int) -> Dict[str,float]:
 
     return feats
 
-def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_secs: int = 120) -> Tuple[np.ndarray,int]:
-    # 1) try libsndfile via soundfile
+def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_secs: int = 120) -> Tuple[np.ndarray, int]:
+    # 1) try libsndfile via soundfile (wav/flac/ogg/aiff)
     try:
         with io.BytesIO(raw) as bio:
             data, sr = sf.read(bio, dtype="float32", always_2d=False)
@@ -154,13 +160,13 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
         if sr != target_sr:
             data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
             sr = target_sr
-        if max_secs and len(data) > max_secs*sr:
-            data = data[:max_secs*sr]
+        if max_secs and len(data) > max_secs * sr:
+            data = data[: max_secs * sr]
         return np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0), sr
     except Exception:
         pass
 
-    # 2) try librosa/audioread via temp file (handles mp3/m4a, etc.)
+    # 2) try librosa/audioread via temp file (mp3/m4a/etc.)
     try:
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=True) as tmp:
             tmp.write(raw); tmp.flush()
@@ -169,8 +175,8 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
     except Exception:
         pass
 
-    # 3) if video, extract audio with moviepy then decode
-    if ext.lower() in {"mp4","m4v","mov","webm","mkv"}:
+    # 3) if video container, extract audio with moviepy then decode
+    if ext.lower() in {"mp4", "m4v", "mov", "webm", "mkv"}:
         try:
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=True) as vtmp, \
                  tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as wtmp:
@@ -185,7 +191,7 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
 
     raise ValueError("Unable to decode file. (For mp4/m4a, ffmpeg support may be required.)")
 
-def features_from_bytes(raw: bytes, ext: str, target_sr: int, max_secs: int) -> Dict[str,float]:
+def features_from_bytes(raw: bytes, ext: str, target_sr: int, max_secs: int) -> Dict[str, float]:
     y, sr = load_audio_any(raw, ext=ext, target_sr=target_sr, mono=True, max_secs=max_secs)
     return extract_features_array(y, sr)
 
@@ -193,10 +199,8 @@ def features_from_bytes(raw: bytes, ext: str, target_sr: int, max_secs: int) -> 
 def predict_dataframe(model, encoder, X: pd.DataFrame, top_k: int = 5):
     X = align_columns_to_model(X, model)
     y_pred = model.predict(X)
-    if np.issubdtype(np.array(y_pred).dtype, np.number):
-        labels = encoder.inverse_transform(y_pred.astype(int))
-    else:
-        labels = y_pred.astype(str)
+    # map numeric codes -> human labels
+    labels = encoder.inverse_transform(y_pred.astype(int)) if np.issubdtype(np.array(y_pred).dtype, np.number) else y_pred.astype(str)
     out = pd.DataFrame({"pred_idx": y_pred, "pred_label": labels})
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X)
@@ -206,7 +210,7 @@ def predict_dataframe(model, encoder, X: pd.DataFrame, top_k: int = 5):
         out["top_probs"]  = [[float(proba[r, i]) for i in row] for r, row in enumerate(order)]
     return out
 
-def build_zip_by_genre(rows: List[Tuple[str,str,bytes]], preds_df: pd.DataFrame) -> bytes:
+def build_zip_by_genre(rows: List[Tuple[str, str, bytes]], preds_df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for genre, fname, fbytes in rows:
@@ -246,12 +250,12 @@ uploaded = st.file_uploader(
 
 if uploaded:
     items = []      # (name, raw, ext)
-    feat_rows = []  # list of dicts
+    feat_rows = []  # dicts
     progress = st.progress(0)
     for i, f in enumerate(uploaded, start=1):
         raw = f.read()
         name = f.name
-        ext  = name.split(".")[-1].lower() if "." in name else ""
+        ext  = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         try:
             feats = features_from_bytes(raw, ext=ext, target_sr=int(target_sr), max_secs=int(max_secs))
             feats["file_name"] = name
@@ -259,7 +263,7 @@ if uploaded:
             feat_rows.append(feats)
         except Exception as e:
             st.error(f"❌ {name}: {e}")
-        progress.progress(i/len(uploaded))
+        progress.progress(i / len(uploaded))
     progress.empty()
 
     if not feat_rows:
@@ -279,10 +283,9 @@ if uploaded:
         for (orig_name, raw, _), (_, prow) in zip(items, preds.iterrows()):
             package_rows.append((str(prow["pred_label"]), orig_name, raw))
 
-        zip_bytes = build_zip_by_genre(
-            package_rows,
-            preds[["file_name", "pred_label", "pred_idx"] + (["top_labels","top_probs"] if "top_labels" in preds.columns else [])]
-        )
+        cols = ["file_name", "pred_label", "pred_idx"]
+        if "top_labels" in preds.columns: cols += ["top_labels", "top_probs"]
+        zip_bytes = build_zip_by_genre(package_rows, preds[cols])
 
         st.download_button(
             "⬇️ Download ZIP (organized by predicted genre)",
@@ -299,4 +302,3 @@ if uploaded:
         st.exception(e)
 else:
     st.info("Upload audio (mp3/wav/…) or video (mp4/mov/…); originals will be organized into genre folders and bundled as a ZIP.")
-PY
