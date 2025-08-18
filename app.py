@@ -1,4 +1,3 @@
-cat > app.py <<'PY'
 # app.py — MilkCrate (audio/video files → genre folders → ZIP)
 # Build: 2025-08-18-audio-only
 # - Accepts audio (wav, mp3, flac, ogg, opus, m4a, aac, wma, aiff, aif, aifc)
