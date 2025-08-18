@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+
+# Local data & caches
+data/
+.streamlit/
+
+# (If you accidentally have an outer repo, ignore the inner folder name)
+MilkCrate/
+# Large local artifacts — do not push
+models/
+model_*.joblib
+model_version*.joblib
+model_ensemble_soft.joblib
+cached_*.npy
+*.pkl
+# Large local artifacts — do not push
+models/
+model_*.joblib
+model_version*.joblib
+model_ensemble_soft.joblib
+cached_*.npy
+*.pkl
