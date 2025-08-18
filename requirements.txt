@@ -1,16 +1,24 @@
-# Core
+# --- Core numeric stack (compatible with Python 3.10) ---
 numpy==1.26.4
 scipy==1.11.4
 pandas==2.2.2
+
+# Match the model's build to avoid sklearn pickle warnings
 scikit-learn==1.6.1
 joblib==1.3.2
+threadpoolctl==3.5.0
 
-# Audio / video
+# --- Audio feature extraction ---
 librosa==0.10.2.post1
-soundfile==0.12.1
-audioread==3.0.1
-numba==0.59.1
-moviepy==1.0.3
+numba==0.59.1           # needed by librosa
+soundfile==0.12.1       # libsndfile-backed decoder (wav/flac/ogg/aiff)
+audioread==3.0.1        # mp3/m4a/etc via ffmpeg or coreaudio
 
-# App
+# --- Video → audio (for mp4/mov/webm/mkv) ---
+moviepy==1.0.3
+imageio==2.34.1
+imageio-ffmpeg==0.4.9   # bundles ffmpeg for moviepy/audioread on Streamlit Cloud
+
+# --- App ---
 streamlit==1.36.0
+protobuf==4.25.3        # stable with Streamlit 1.36
