@@ -1,5 +1,5 @@
-# app.py — MilkCrate (audio/video → genre folders → ZIP) | Beatport-92 full + robust name parsing
-# Build: 2025-08-18 • beatport92-full-v2
+# app.py — MilkCrate (audio/video → genre folders → ZIP)
+# Build: 2025-08-18 • beatport92-full-v2 (robust ΔMFCC + Chroma parsing)
 
 import io, os, re, json, zipfile, unicodedata, warnings, tempfile
 from typing import Dict, List, Tuple
@@ -48,6 +48,10 @@ def load_encoder(path: str):
 _model_feature_names: List[str] = []
 
 def load_expected_features() -> List[str]:
+    """
+    Expected feature order for inference: prefer model.feature_names_in_,
+    else fall back to artifacts/beatport201611_feature_columns.json.
+    """
     if _model_feature_names:
         return list(_model_feature_names)
     if os.path.exists(EXPECTED_FEATURES_JSON):
@@ -130,15 +134,30 @@ def safe_stat(series: np.ndarray, which: str) -> float:
     else:
         return float(np.nanstd(s)) if s.size else np.nan
 
+def split_base_and_stat(raw_name: str):
+    """
+    Returns (base_without_stat, stat) where stat in {'m','s'} or None.
+    Accepts suffixes: m/s/std/mean/avg/sd/stdev/variance/var.
+    'variance'/'var' map to std ('s') for compatibility.
+    """
+    s = raw_name.lower().replace("_","").replace("-","")
+    for suf in ("mean", "avg", "m"):
+        if s.endswith(suf):
+            return s[: -len(suf)], "m"
+    for suf in ("std", "sd", "stdev", "s", "variance", "var"):
+        if s.endswith(suf):
+            return s[: -len(suf)], "s"
+    return s, None
+
 # ---------- Beatport-92 row builder (robust name parsing) ----------
 def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[str, float]:
     """
     Handles:
-      - zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff} + {m|s}
-      - MFCC:      mfccs{N}{m|s|std}
-      - ΔMFCC:     dmfccs{N}{…} / deltamfccs{N}{…} / mfccs{N}d{…}
-      - Chroma:    chromas{N}{…} / chroma{N}{…} / chromagram{N}{…}
-    Any unknown key -> NaN (imputer can handle a few).
+      - zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff} + mean/std
+      - MFCC:      mfccs{N}{m|s|std|mean|sd}
+      - ΔMFCC:     dmfccs{N}..., deltamfccs{N}..., mfccs{N}d..., mfccs{N}delta..., delta_mfcc{N}...
+      - Chroma:    chromas{N}..., chroma{N}..., chromagram{N}..., chroma_stft{N}...
+    Unknown keys -> NaN (imputer can handle a few).
     """
     row: Dict[str, float] = {}
 
@@ -148,79 +167,68 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
     S = stft_mag(y, n_fft=n_fft, hop=hop)
     zcr = series_zcr(y, hop=hop)
     rms = series_rms(y, hop=hop, n_fft=n_fft)
-    sc = series_centroid(S, sr)
+    sc  = series_centroid(S, sr)
     sbw = series_bandwidth(S, sr)
     sro = series_rolloff(S, sr, 0.85)
     sent = series_spec_entropy(S)
     sflux = series_spec_flux(S)
     eent = series_energy_entropy(y, frame_len=n_fft, hop=hop, subframes=10)
 
-    # MFCC + ΔMFCC (20 by default; training often used 13, that's fine)
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)   # (20, T)
-    dmfcc = librosa.feature.delta(mfcc, order=1)         # (20, T)
+    # MFCC + ΔMFCC (20; many trainings use first 13 — computing 20 is fine)
+    mfcc  = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)   # (20, T)
+    dmfcc = librosa.feature.delta(mfcc, order=1)          # (20, T)
 
-    # Chroma (12, T)
+    # Chroma (12)
     chroma = librosa.feature.chroma_stft(S=S, sr=sr)
 
     for key in expected_cols:
-        # strip numeric prefix "NN-"
-        base = re.sub(r"^\d+-", "", key)
+        # strip numeric prefix 'NN-'
+        name = re.sub(r"^\d+-", "", key)
+        base, which = split_base_and_stat(name)
 
-        # detect mean/std suffix
-        stat_suffix = None
-        if base.endswith(("std", "STD")):
-            stat_suffix = "std"; base = base[:-3]
-        elif base.endswith("m"):
-            stat_suffix = "m"; base = base[:-1]
-        elif base.endswith("s"):
-            stat_suffix = "s"; base = base[:-1]
+        out = np.nan
+        b = base  # normalized
 
-        val = np.nan
-        b = base.lower().replace("_","").replace("-","")
-
-        # core groups
-        if b == "zcr" and stat_suffix:
-            val = safe_stat(zcr, "m" if stat_suffix=="m" else "s")
-        elif b == "energy" and stat_suffix:
-            val = safe_stat(rms, "m" if stat_suffix=="m" else "s")
-        elif b in ("energyentropy","energyent") and stat_suffix:
-            val = safe_stat(eent, "m" if stat_suffix=="m" else "s")
-        elif b in ("spectralcentroid","speccentroid") and stat_suffix:
-            val = safe_stat(sc, "m" if stat_suffix=="m" else "s")
-        elif b in ("spectralspread","specspread") and stat_suffix:
-            val = safe_stat(sbw, "m" if stat_suffix=="m" else "s")
-        elif b in ("spectralentropy","specentropy") and stat_suffix:
-            val = safe_stat(sent, "m" if stat_suffix=="m" else "s")
-        elif b in ("spectralflux","specflux") and stat_suffix:
-            val = safe_stat(sflux, "m" if stat_suffix=="m" else "s")
-        elif b in ("spectralrolloff","specrolloff") and stat_suffix:
-            val = safe_stat(sro, "m" if stat_suffix=="m" else "s")
+        # ----- core groups -----
+        if b == "zcr" and which:                      out = safe_stat(zcr, which)
+        elif b == "energy" and which:                 out = safe_stat(rms, which)
+        elif b in ("energyentropy","energyent") and which: out = safe_stat(eent, which)
+        elif b in ("spectralcentroid","speccentroid") and which: out = safe_stat(sc, which)
+        elif b in ("spectralspread","specspread") and which:     out = safe_stat(sbw, which)
+        elif b in ("spectralentropy","specentropy") and which:   out = safe_stat(sent, which)
+        elif b in ("spectralflux","specflux") and which:         out = safe_stat(sflux, which)
+        elif b in ("spectralrolloff","specrolloff") and which:   out = safe_stat(sro, which)
 
         else:
-            # MFCC variants
-            m_dm1 = re.match(r"(?:dmfccs|deltamfccs)(\d+)$", b)   # dmfccs1, deltamfccs1
-            m_dm2 = re.match(r"mfccs(\d+)d$", b)                  # mfccs1d
-            m_mf  = re.match(r"mfccs(\d+)$", b)                   # mfccs1
+            s = b
+            # ---- ΔMFCC detection ----
+            is_delta = (
+                "deltamfcc" in s or
+                s.startswith("dmfccs") or
+                re.search(r"mfccs\d+d$", s) is not None or
+                re.search(r"mfccs\d+delta$", s) is not None or
+                re.search(r"^deltamfccs?\d+$", s) is not None or
+                re.search(r"^dmfccs?\d+$", s) is not None or
+                re.search(r"^delta_mfccs?\d+$", s) is not None
+            )
 
-            # Chroma variants
-            m_ch  = re.match(r"(?:chromas|chroma|chromagram|chromagrams)(\d+)$", b)
+            # MFCC index
+            m_idx = re.search(r"mfccs(\d+)", s)
+            # Chroma variants (chroma, chromas, chromagram, chroma_stft)
+            c_idx = re.search(r"(?:chromas|chroma|chromagram|chromagrams|chromastft)(\d+)", s)
 
-            if (m_dm1 or m_dm2) and stat_suffix:  # ΔMFCC
-                idx = int((m_dm1 or m_dm2).group(1)) - 1
-                if 0 <= idx < dmfcc.shape[0]:
-                    val = safe_stat(dmfcc[idx], "m" if stat_suffix=="m" else "s")
+            if m_idx and which:
+                i = int(m_idx.group(1)) - 1
+                if 0 <= i < mfcc.shape[0]:
+                    src = dmfcc if is_delta else mfcc
+                    out = safe_stat(src[i], which)
 
-            elif m_mf and stat_suffix:  # MFCC
-                idx = int(m_mf.group(1)) - 1
-                if 0 <= idx < mfcc.shape[0]:
-                    val = safe_stat(mfcc[idx], "m" if stat_suffix=="m" else "s")
+            elif c_idx and which:
+                j = int(c_idx.group(1)) - 1
+                if 0 <= j < chroma.shape[0]:
+                    out = safe_stat(chroma[j], which)
 
-            elif m_ch and stat_suffix:  # Chroma
-                idx = int(m_ch.group(1)) - 1
-                if 0 <= idx < chroma.shape[0]:
-                    val = safe_stat(chroma[idx], "m" if stat_suffix=="m" else "s")
-
-        row[key] = float(val) if np.isfinite(val) else np.nan
+        row[key] = float(out) if np.isfinite(out) else np.nan
 
     return row
 
@@ -304,7 +312,8 @@ with st.sidebar:
 
 model = load_model(model_path)
 encoder = load_encoder(encoder_path)
-_model_feature_names = list(getattr(model, "feature_names_in_", []))  # capture for load_expected_features()
+# Capture model feature names for expected-order alignment
+_model_feature_names = list(getattr(model, "feature_names_in_", []))
 
 with st.expander("🔎 Debug: label map"):
     classes, names = get_display_names(model, encoder)
@@ -360,10 +369,10 @@ if uploaded:
         st.write(f"Missing keys: 0")
         st.progress(present_any / max(1, len(expected_cols)))
         st.write({
-            "core (zcr/energy/entropy/spec*)": present_count(r'^(zcr|energy(entropy)?|spectral(centroid|spread|entropy|flux|rolloff))(m|s|std)?$'),
-            "MFCC":   present_count(r'^mfccs\d+(m|s|std)?$'),
-            "ΔMFCC":  present_count(r'^(?:dmfccs|deltamfccs|mfccs\d+d)(m|s|std)?$'),
-            "Chroma": present_count(r'^(?:chromas|chroma|chromagram|chromagrams)\d+(m|s|std)?$'),
+            "core (zcr/energy/entropy/spec*)": present_count(r'^(zcr|energy(entropy)?|spectral(centroid|spread|entropy|flux|rolloff))(m|s|std|mean|sd|stdev|variance|var)?$'),
+            "MFCC":   present_count(r'^mfccs\d+(m|s|std|mean|sd|stdev|variance|var)?$'),
+            "ΔMFCC":  present_count(r'^(?:dmfccs|deltamfccs|mfccs\d+d|mfccs\d+delta|delta_mfccs?\d+)(m|s|std|mean|sd|stdev|variance|var)?$'),
+            "Chroma": present_count(r'^(?:chromas|chroma|chromagram|chromagrams|chromastft)\d+(m|s|std|mean|sd|stdev|variance|var)?$'),
         })
 
     try:
