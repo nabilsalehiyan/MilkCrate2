@@ -1,5 +1,5 @@
 # app.py — MilkCrate (audio/video → genre folders → ZIP)
-# Build: 2025-08-18 • beatport92-full-v2 (robust ΔMFCC + Chroma parsing)
+# Build: 2025-08-18 • beatport92-full-v3 (adds chromavector*/chromadeviation* mapping)
 
 import io, os, re, json, zipfile, unicodedata, warnings, tempfile
 from typing import Dict, List, Tuple
@@ -21,7 +21,7 @@ st.set_page_config(page_title="MilkCrate • Audio → Genre ZIP", layout="wide"
 # ---------- Config ----------
 DEFAULT_MODEL_PATH = "artifacts/beatport201611_hgb.joblib"
 DEFAULT_ENCODER_PATH = "artifacts/label_encoder.joblib"
-EXPECTED_FEATURES_JSON = "artifacts/beatport201611_feature_columns.json"
+EXPECTED_FEATURES_JSON = "artifacts/beatport201611_feature_columns.json"  # optional fallback
 
 TARGET_SR_DEFAULT = 22050
 MAX_ANALYZE_SECONDS_DEFAULT = 120
@@ -49,8 +49,8 @@ _model_feature_names: List[str] = []
 
 def load_expected_features() -> List[str]:
     """
-    Expected feature order for inference: prefer model.feature_names_in_,
-    else fall back to artifacts/beatport201611_feature_columns.json.
+    Inference column order: prefer model.feature_names_in_,
+    else fall back to artifacts JSON (if present).
     """
     if _model_feature_names:
         return list(_model_feature_names)
@@ -62,7 +62,7 @@ def load_expected_features() -> List[str]:
                 return cols
         except Exception:
             pass
-    st.error("No expected feature list found on model or JSON; cannot build Beatport-92 features.")
+    st.error("No expected feature list found on model or JSON; cannot build features.")
     st.stop()
 
 # ---------- Utils ----------
@@ -138,7 +138,7 @@ def split_base_and_stat(raw_name: str):
     """
     Returns (base_without_stat, stat) where stat in {'m','s'} or None.
     Accepts suffixes: m/s/std/mean/avg/sd/stdev/variance/var.
-    'variance'/'var' map to std ('s') for compatibility.
+    'variance'/'var' map to std ('s').
     """
     s = raw_name.lower().replace("_","").replace("-","")
     for suf in ("mean", "avg", "m"):
@@ -149,15 +149,15 @@ def split_base_and_stat(raw_name: str):
             return s[: -len(suf)], "s"
     return s, None
 
-# ---------- Beatport-92 row builder (robust name parsing) ----------
-def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[str, float]:
+# ---------- Row builder matching your exact names (incl. chromavector/ chromadeviation) ----------
+def build_feature_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[str, float]:
     """
     Handles:
       - zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff} + mean/std
-      - MFCC:      mfccs{N}{m|s|std|mean|sd}
-      - ΔMFCC:     dmfccs{N}..., deltamfccs{N}..., mfccs{N}d..., mfccs{N}delta..., delta_mfcc{N}...
-      - Chroma:    chromas{N}..., chroma{N}..., chromagram{N}..., chroma_stft{N}...
-    Unknown keys -> NaN (imputer can handle a few).
+      - MFCC:      mfccs{1..20}{m|s|std|mean|sd} (your model uses 1..13)
+      - Chroma:    chromavector{1..12}{m|s|std} + chromadeviation{m|s|std}
+      - (Delta MFCCs are NOT present in your model, so not required.)
+    Unknown keys -> NaN (model imputer will handle extras, but we aim to fill all common ones).
     """
     row: Dict[str, float] = {}
 
@@ -174,24 +174,23 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
     sflux = series_spec_flux(S)
     eent = series_energy_entropy(y, frame_len=n_fft, hop=hop, subframes=10)
 
-    # MFCC + ΔMFCC (20; many trainings use first 13 — computing 20 is fine)
-    mfcc  = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)   # (20, T)
-    dmfcc = librosa.feature.delta(mfcc, order=1)          # (20, T)
+    # MFCCs (20; training uses first 13)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)   # (20, T)
 
-    # Chroma (12)
-    chroma = librosa.feature.chroma_stft(S=S, sr=sr)
+    # Chroma vector (12) + deviation
+    chroma = librosa.feature.chroma_stft(S=S, sr=sr)     # (12, T)
+    chroma_dev = np.std(chroma, axis=0)                  # framewise deviation used by pyAudioAnalysis
 
     for key in expected_cols:
         # strip numeric prefix 'NN-'
         name = re.sub(r"^\d+-", "", key)
         base, which = split_base_and_stat(name)
-
         out = np.nan
         b = base  # normalized
 
         # ----- core groups -----
-        if b == "zcr" and which:                      out = safe_stat(zcr, which)
-        elif b == "energy" and which:                 out = safe_stat(rms, which)
+        if b == "zcr" and which:                          out = safe_stat(zcr, which)
+        elif b == "energy" and which:                     out = safe_stat(rms, which)
         elif b in ("energyentropy","energyent") and which: out = safe_stat(eent, which)
         elif b in ("spectralcentroid","speccentroid") and which: out = safe_stat(sc, which)
         elif b in ("spectralspread","specspread") and which:     out = safe_stat(sbw, which)
@@ -201,32 +200,28 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
 
         else:
             s = b
-            # ---- ΔMFCC detection ----
-            is_delta = (
-                "deltamfcc" in s or
-                s.startswith("dmfccs") or
-                re.search(r"mfccs\d+d$", s) is not None or
-                re.search(r"mfccs\d+delta$", s) is not None or
-                re.search(r"^deltamfccs?\d+$", s) is not None or
-                re.search(r"^dmfccs?\d+$", s) is not None or
-                re.search(r"^delta_mfccs?\d+$", s) is not None
-            )
 
-            # MFCC index
-            m_idx = re.search(r"mfccs(\d+)", s)
-            # Chroma variants (chroma, chromas, chromagram, chroma_stft)
-            c_idx = re.search(r"(?:chromas|chroma|chromagram|chromagrams|chromastft)(\d+)", s)
+            # MFCC index: mfccs{N}
+            m_mf = re.match(r"mfccs(\d+)$", s)
 
-            if m_idx and which:
-                i = int(m_idx.group(1)) - 1
+            # Chroma vector: chromavector{N}
+            m_cv = re.match(r"chromavector(\d+)$", s)
+
+            # Chroma deviation: chromadeviation
+            is_cdev = (s == "chromadeviation")
+
+            if m_mf and which:
+                i = int(m_mf.group(1)) - 1
                 if 0 <= i < mfcc.shape[0]:
-                    src = dmfcc if is_delta else mfcc
-                    out = safe_stat(src[i], which)
+                    out = safe_stat(mfcc[i], which)
 
-            elif c_idx and which:
-                j = int(c_idx.group(1)) - 1
+            elif m_cv and which:
+                j = int(m_cv.group(1)) - 1
                 if 0 <= j < chroma.shape[0]:
                     out = safe_stat(chroma[j], which)
+
+            elif is_cdev and which:
+                out = safe_stat(chroma_dev, which)
 
         row[key] = float(out) if np.isfinite(out) else np.nan
 
@@ -300,7 +295,7 @@ def build_zip_by_genre(rows, preds_df: pd.DataFrame) -> bytes:
 
 # ---------- UI ----------
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • beatport92-full-v2 (ΔMFCC+Chroma parsing)")
+st.caption("Build 2025-08-18 • beatport92-full-v3 (chromavector/chromadeviation)")
 
 with st.sidebar:
     st.header("Settings")
@@ -340,7 +335,7 @@ if uploaded:
         ext  = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         try:
             y, sr = load_audio_any(raw, ext=ext, target_sr=int(target_sr), mono=True, max_secs=int(max_secs))
-            row = build_beatport92_row(y, sr, expected_cols)
+            row = build_feature_row(y, sr, expected_cols)
             row["file_name"] = name
             items.append((name, raw, ext))
             rows.append(row)
@@ -371,8 +366,7 @@ if uploaded:
         st.write({
             "core (zcr/energy/entropy/spec*)": present_count(r'^(zcr|energy(entropy)?|spectral(centroid|spread|entropy|flux|rolloff))(m|s|std|mean|sd|stdev|variance|var)?$'),
             "MFCC":   present_count(r'^mfccs\d+(m|s|std|mean|sd|stdev|variance|var)?$'),
-            "ΔMFCC":  present_count(r'^(?:dmfccs|deltamfccs|mfccs\d+d|mfccs\d+delta|delta_mfccs?\d+)(m|s|std|mean|sd|stdev|variance|var)?$'),
-            "Chroma": present_count(r'^(?:chromas|chroma|chromagram|chromagrams|chromastft)\d+(m|s|std|mean|sd|stdev|variance|var)?$'),
+            "Chroma": present_count(r'^(chromavector\d+|chromadeviation)(m|s|std|mean|sd|stdev|variance|var)?$'),
         })
 
     try:
