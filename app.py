@@ -1,19 +1,8 @@
-# app.py — MilkCrate (audio/video → genre folders → ZIP) + Diagnostics
-# Build: 2025-08-18-audio-only + feature-alignment
-# - Accepts audio (wav, mp3, flac, ogg, opus, m4a, aac, wma, aiff, aif, aifc)
-# - Accepts video (mp4, m4v, mov, webm, mkv) and extracts audio
-# - Extracts features with librosa, predicts with sklearn model + LabelEncoder
-# - Groups ORIGINAL uploads into folders named by predicted genre; offers ZIP download
-# - Diagnostics panel to check feature coverage vs. model expectations
+# app.py — MilkCrate (audio/video → genre ZIP) with Beatport-92 feature mapping
+# This extractor emits columns like: "1-zcrm", "2-energym", "3-energyentropym", "9-mfccs1m", ...
+# so your model won't collapse to a single class.
 
-import io
-import os
-import re
-import json
-import zipfile
-import unicodedata
-import warnings
-import tempfile
+import io, os, re, json, zipfile, unicodedata, warnings, tempfile
 from typing import Dict, List, Tuple
 
 import joblib
@@ -29,23 +18,21 @@ from moviepy.editor import AudioFileClip  # fallback for video containers
 
 warnings.filterwarnings("ignore")
 
-# --------- Config (changeable in sidebar) ---------
-DEFAULT_MODEL_PATH = "artifacts/beatport201611_hgb.joblib"   # ~46MB, committed to repo
-DEFAULT_ENCODER_PATH = "artifacts/label_encoder.joblib"      # 23-class encoder
+# ---------- Config ----------
+DEFAULT_MODEL_PATH = "artifacts/beatport201611_hgb.joblib"
+DEFAULT_ENCODER_PATH = "artifacts/label_encoder.joblib"
 EXPECTED_FEATURES_JSON = "artifacts/beatport201611_feature_columns.json"
 
 TARGET_SR_DEFAULT = 22050
 MAX_ANALYZE_SECONDS_DEFAULT = 120
 TOP_K_DEFAULT = 5
 
-SUPPORTED_AUDIO = {
-    "wav", "mp3", "flac", "ogg", "oga", "opus", "m4a", "aac", "wma", "aiff", "aif", "aifc"
-}
-SUPPORTED_VIDEO = {"mp4", "m4v", "mov", "webm", "mkv"}
+SUPPORTED_AUDIO = {"wav","mp3","flac","ogg","oga","opus","m4a","aac","wma","aiff","aif","aifc"}
+SUPPORTED_VIDEO = {"mp4","m4v","mov","webm","mkv"}
 
 st.set_page_config(page_title="MilkCrate • Audio → Genre ZIP", layout="wide")
 
-# --------- Cache loaders ---------
+# ---------- Loaders ----------
 @st.cache_resource(show_spinner=False)
 def load_model(path: str):
     if not os.path.exists(path):
@@ -60,94 +47,33 @@ def load_encoder(path: str):
         st.stop()
     return joblib.load(path)
 
-# --------- Utils ---------
-def sanitize_filename(name: str) -> str:
-    base = os.path.basename(name or "audio")
-    base = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")
-    base = re.sub(r"[^\w\-.]+", "_", base).strip("._")
-    return base or "audio"
-
-def load_expected_features_fallback() -> List[str]:
-    try:
-        if os.path.exists(EXPECTED_FEATURES_JSON):
+def load_expected_features() -> List[str]:
+    # Prefer model.feature_names_in_; fall back to JSON list (exact order matters)
+    names = list(getattr(model, "feature_names_in_", []))
+    if names:
+        return list(names)
+    if os.path.exists(EXPECTED_FEATURES_JSON):
+        try:
             with open(EXPECTED_FEATURES_JSON, "r") as f:
                 cols = json.load(f)
             if isinstance(cols, list) and cols:
                 return cols
-    except Exception:
-        pass
+        except Exception:
+            pass
     return []
 
-def pad2(n: int) -> str:
-    return f"{n:02d}"
+# ---------- Utils ----------
+def sanitize_filename(name: str) -> str:
+    base = os.path.basename(name or "audio")
+    base = unicodedata.normalize("NFKD", base).encode("ascii","ignore").decode("ascii")
+    base = re.sub(r"[^\w\-.]+","_", base).strip("._")
+    return base or "audio"
 
-def add_aliases_to_match_expected(feats: Dict[str, float], expected: List[str]) -> Dict[str, float]:
-    """
-    Add alternate keys for common naming conventions (only if the alias is in expected).
-    E.g., mfcc_1_mean -> mfcc_01_mean, spec_centroid_mean -> spectral_centroid_mean, etc.
-    """
-    if not expected:
-        return feats
-    out = dict(feats)
-
-    expected_set = set(expected)
-
-    # Basic synonyms
-    synonyms = {
-        "zcr_mean": "zero_crossing_rate_mean",
-        "zcr_std": "zero_crossing_rate_std",
-        "spec_centroid_mean": "spectral_centroid_mean",
-        "spec_centroid_std": "spectral_centroid_std",
-        "spec_bw_mean": "spectral_bandwidth_mean",
-        "spec_bw_std": "spectral_bandwidth_std",
-        "spec_rolloff_mean": "spectral_rolloff_mean",
-        "spec_rolloff_std": "spectral_rolloff_std",
-        "duration_s": "duration",
-        "chroma_mean": "chroma_stft_mean",
-        "chroma_std": "chroma_stft_std",
-        "tempo_mean": "bpm_mean",
-        "tempo_std": "bpm_std",
-        "rms_mean": "rms_energy_mean",
-        "rms_std": "rms_energy_std",
-    }
-    for src, alias in synonyms.items():
-        if src in feats and alias in expected_set:
-            out[alias] = feats[src]
-
-    # MFCC / chroma / contrast / tonnetz: add zero-padded variants
-    for i in range(1, 21):  # mfcc 1..20
-        k1m = f"mfcc_{i}_mean"; k1s = f"mfcc_{i}_std"
-        k2m = f"mfcc_{pad2(i)}_mean"; k2s = f"mfcc_{pad2(i)}_std"
-        if k1m in feats and k2m in expected_set: out[k2m] = feats[k1m]
-        if k1s in feats and k2s in expected_set: out[k2s] = feats[k1s]
-    for i in range(1, 13):  # chroma 1..12
-        k1m = f"chroma_{i:01d}_mean"; k1s = f"chroma_{i:01d}_std"
-        k2m = f"chroma_{pad2(i)}_mean"; k2s = f"chroma_{pad2(i)}_std"
-        if k1m in feats and k2m in expected_set: out[k2m] = feats[k1m]
-        if k1s in feats and k2s in expected_set: out[k2s] = feats[k1s]
-    for i in range(1, 11):  # contrast 1..10 (safe upper bound)
-        k1m = f"contrast_{i}_mean"; k1s = f"contrast_{i}_std"
-        k2m = f"contrast_{pad2(i)}_mean"; k2s = f"contrast_{pad2(i)}_std"
-        if k1m in feats and k2m in expected_set: out[k2m] = feats[k1m]
-        if k1s in feats and k2s in expected_set: out[k2s] = feats[k1s]
-    for i in range(1, 7):   # tonnetz 1..6
-        k1m = f"tonnetz_{i}_mean"; k1s = f"tonnetz_{i}_std"
-        k2m = f"tonnetz_{pad2(i)}_mean"; k2s = f"tonnetz_{pad2(i)}_std"
-        if k1m in feats and k2m in expected_set: out[k2m] = feats[k1m]
-        if k1s in feats and k2s in expected_set: out[k2s] = feats[k1s]
-
-    return out
-
-def align_columns_to_model(X: pd.DataFrame, model):
-    names = list(getattr(model, "feature_names_in_", []))
-    if not names:
-        names = load_expected_features_fallback()
-    if names:
-        missing = [c for c in names if c not in X.columns]
-        if missing:
-            st.warning(f"Input missing {len(missing)} of {len(names)} expected columns. First few: {missing[:10]}")
-        X = X.reindex(columns=names)
-    return X
+def align_columns_to_expected(df: pd.DataFrame, expected: List[str]) -> pd.DataFrame:
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        st.warning(f"Input missing {len(missing)} of {len(expected)} expected columns. First few: {missing[:10]}")
+    return df.reindex(columns=expected)
 
 def get_display_names(model, encoder):
     classes = getattr(model, "classes_", None)
@@ -162,73 +88,146 @@ def get_display_names(model, encoder):
         return arr, names
     return arr, arr
 
-# --------- Feature extraction ---------
-def extract_features_array(y: np.ndarray, sr: int) -> Dict[str, float]:
-    feats: Dict[str, float] = {}
-    if y is None or len(y) == 0:
-        return feats
+# ---------- Low-level feature helpers (framewise) ----------
+def frame_rms(y, hop=512, n_fft=2048):
+    return librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop)[0]
 
-    feats["duration_s"] = float(len(y) / sr)
+def frame_zcr(y, hop=512):
+    return librosa.feature.zero_crossing_rate(y=y, hop_length=hop)[0]
 
-    # Time-domain
-    rms = librosa.feature.rms(y=y)
-    zcr = librosa.feature.zero_crossing_rate(y=y)
-    feats["rms_mean"] = float(np.mean(rms)); feats["rms_std"] = float(np.std(rms))
-    feats["zcr_mean"] = float(np.mean(zcr)); feats["zcr_std"] = float(np.std(zcr))
+def stft_mag(y, n_fft=2048, hop=512):
+    return np.abs(librosa.stft(y=y, n_fft=n_fft, hop_length=hop))
 
-    # Spectral
-    S = np.abs(librosa.stft(y=y, n_fft=2048, hop_length=512))
-    feats["spec_centroid_mean"] = float(np.mean(librosa.feature.spectral_centroid(S=S, sr=sr)))
-    feats["spec_centroid_std"]  = float(np.std(librosa.feature.spectral_centroid(S=S, sr=sr)))
-    feats["spec_bw_mean"]       = float(np.mean(librosa.feature.spectral_bandwidth(S=S, sr=sr)))
-    feats["spec_bw_std"]        = float(np.std(librosa.feature.spectral_bandwidth(S=S, sr=sr)))
-    feats["spec_rolloff_mean"]  = float(np.mean(librosa.feature.spectral_rolloff(S=S, sr=sr, roll_percent=0.85)))
-    feats["spec_rolloff_std"]   = float(np.std(librosa.feature.spectral_rolloff(S=S, sr=sr, roll_percent=0.85)))
+def spectral_centroid_series(S, sr):
+    return librosa.feature.spectral_centroid(S=S, sr=sr)[0]
 
-    # Tempo
-    try:
-        tempo_seq = librosa.beat.tempo(y=y, sr=sr, hop_length=512, aggregate=None)
-        feats["tempo_mean"] = float(np.mean(tempo_seq)) if tempo_seq.size else np.nan
-        feats["tempo_std"]  = float(np.std(tempo_seq)) if tempo_seq.size else np.nan
-    except Exception:
-        feats["tempo_mean"] = np.nan; feats["tempo_std"] = np.nan
+def spectral_bandwidth_series(S, sr):
+    return librosa.feature.spectral_bandwidth(S=S, sr=sr)[0]
 
-    # Chroma
-    chroma = librosa.feature.chroma_stft(S=S, sr=sr)
-    feats["chroma_mean"] = float(np.mean(chroma)); feats["chroma_std"] = float(np.std(chroma))
-    for i in range(min(12, chroma.shape[0])):
-        feats[f"chroma_{i+1}_mean"] = float(np.mean(chroma[i]))
-        feats[f"chroma_{i+1}_std"]  = float(np.std(chroma[i]))
+def spectral_rolloff_series(S, sr, roll=0.85):
+    return librosa.feature.spectral_rolloff(S=S, sr=sr, roll_percent=roll)[0]
 
-    # MFCCs
+def spectral_entropy_series(S, eps=1e-10):
+    # entropy per frame over frequency bins
+    P = S / (S.sum(axis=0, keepdims=True) + eps)
+    ent = -np.sum(P * np.log(P + eps), axis=0)  # nats
+    return ent
+
+def spectral_flux_series(S):
+    # positive flux between consecutive frames, L2-normed
+    Sn = S / (np.linalg.norm(S, axis=0, keepdims=True) + 1e-10)
+    d = np.diff(Sn, axis=1)
+    flux = np.sqrt((np.clip(d, 0, None)**2).sum(axis=0))
+    # align length with other framewise series by padding one NaN at start
+    return np.concatenate([[np.nan], flux])
+
+def energy_entropy_series(y, frame_len=2048, hop=512, subframes=10, eps=1e-12):
+    # For each analysis frame, split it into 'subframes' segments and compute entropy of sub-energies
+    if len(y) < frame_len:
+        y = np.pad(y, (0, frame_len - len(y)))
+    frames = librosa.util.frame(y, frame_length=frame_len, hop_length=hop).T  # shape: (n_frames, frame_len)
+    ent = []
+    seg_len = frame_len // subframes
+    for fr in frames:
+        # split into equal segments
+        segs = [fr[i*seg_len:(i+1)*seg_len] for i in range(subframes)]
+        energies = np.array([np.sum(s**2) for s in segs], dtype=float)
+        p = energies / (energies.sum() + eps)
+        ent.append(-np.sum(p * np.log(p + eps)))
+    return np.array(ent)
+
+# ---------- Beatport-92 row builder ----------
+def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[str, float]:
+    """
+    Populate EXACT expected keys. We parse names like '1-zcrm', '2-energym', '9-mfccs1m', '33-mfccs1s', '57-chromas1m', etc.
+    If a key is unknown, we set NaN so the model's imputer can handle it.
+    """
+    row: Dict[str, float] = {}
+
+    # Precompute primitives
+    hop = 512
+    n_fft = 2048
+    S = stft_mag(y, n_fft=n_fft, hop=hop)
+    zcr = frame_zcr(y, hop=hop)
+    rms = frame_rms(y, hop=hop, n_fft=n_fft)
+    sc = spectral_centroid_series(S, sr)
+    sbw = spectral_bandwidth_series(S, sr)
+    sro = spectral_rolloff_series(S, sr, 0.85)
+    sent = spectral_entropy_series(S)
+    sflux = spectral_flux_series(S)
+
+    # MFCCs (20)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-    for i in range(mfcc.shape[0]):
-        feats[f"mfcc_{i+1}_mean"] = float(np.mean(mfcc[i]))
-        feats[f"mfcc_{i+1}_std"]  = float(np.std(mfcc[i]))
+    # Chroma STFT (12)
+    chroma = librosa.feature.chroma_stft(S=S, sr=sr)
 
-    # Spectral contrast
-    try:
-        contrast = librosa.feature.spectral_contrast(S=S, sr=sr)
-        for i in range(contrast.shape[0]):
-            feats[f"contrast_{i+1}_mean"] = float(np.mean(contrast[i]))
-            feats[f"contrast_{i+1}_std"]  = float(np.std(contrast[i]))
-    except Exception:
-        pass
+    # Energy entropy (framewise)
+    eent = energy_entropy_series(y, frame_len=n_fft, hop=hop, subframes=10)
 
-    # Tonnetz
-    try:
-        y_h = librosa.effects.harmonic(y)
-        tonnetz = librosa.feature.tonnetz(y=y_h, sr=sr)
-        for i in range(tonnetz.shape[0]):
-            feats[f"tonnetz_{i+1}_mean"] = float(np.mean(tonnetz[i]))
-            feats[f"tonnetz_{i+1}_std"]  = float(np.std(tonnetz[i]))
-    except Exception:
-        pass
+    # Helper to fetch mean/std from a series, robust to NaNs
+    def stat(series, which: str):
+        s = np.asarray(series, dtype=float)
+        if which == "m":
+            return float(np.nanmean(s))
+        return float(np.nanstd(s))
 
-    return feats
+    # Map keys
+    for key in expected_cols:
+        # Strip the numeric prefix "NN-"
+        name = re.sub(r"^\d+-", "", key)
 
+        # Mean/Std suffix handling (final char m/s)
+        m_or_s = None
+        if name.endswith("m"):
+            m_or_s = "m"; base = name[:-1]
+        elif name.endswith("s"):
+            m_or_s = "s"; base = name[:-1]
+        else:
+            base = name
+
+        val = np.nan  # default if unknown
+
+        # --- Single-feature bases ---
+        if base == "zcr" and m_or_s:
+            val = stat(zcr, m_or_s)
+        elif base == "energy" and m_or_s:
+            val = stat(rms, m_or_s)  # using RMS as energy proxy
+        elif base == "energyentropy" and m_or_s:
+            val = stat(eent, m_or_s)
+        elif base == "spectralcentroid" and m_or_s:
+            val = stat(sc, m_or_s)
+        elif base == "spectralspread" and m_or_s:
+            val = stat(sbw, m_or_s)
+        elif base == "spectralentropy" and m_or_s:
+            val = stat(sent, m_or_s)
+        elif base == "spectralflux" and m_or_s:
+            val = stat(sflux, m_or_s)
+        elif base == "spectralrolloff" and m_or_s:
+            val = stat(sro, m_or_s)
+
+        # --- MFCCs: mfccs{1..20}{m|s} ---
+        elif base.startswith("mfccs") and m_or_s:
+            m = re.match(r"mfccs(\d+)$", base)
+            if m:
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < mfcc.shape[0]:
+                    val = stat(mfcc[idx], m_or_s)
+
+        # --- Chroma: chromas{1..12}{m|s} ---
+        elif base.startswith("chromas") and m_or_s:
+            m = re.match(r"chromas(\d+)$", base)
+            if m:
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < chroma.shape[0]:
+                    val = stat(chroma[idx], m_or_s)
+
+        row[key] = float(val) if np.isfinite(val) else np.nan
+
+    return row
+
+# ---------- Decode audio or extract from video ----------
 def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_secs: int = 120) -> Tuple[np.ndarray, int]:
-    # 1) try libsndfile via soundfile (wav/flac/ogg/aiff)
+    # 1) soundfile (wav/flac/ogg/aiff)
     try:
         with io.BytesIO(raw) as bio:
             data, sr = sf.read(bio, dtype="float32", always_2d=False)
@@ -243,7 +242,7 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
     except Exception:
         pass
 
-    # 2) try librosa/audioread via temp file (mp3/m4a/etc.)
+    # 2) librosa/audioread via temp file (mp3/m4a/etc.)
     try:
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=True) as tmp:
             tmp.write(raw); tmp.flush()
@@ -252,8 +251,8 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
     except Exception:
         pass
 
-    # 3) if video container, extract audio with moviepy then decode
-    if ext.lower() in {"mp4", "m4v", "mov", "webm", "mkv"}:
+    # 3) video containers via moviepy
+    if ext.lower() in SUPPORTED_VIDEO:
         try:
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=True) as vtmp, \
                  tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as wtmp:
@@ -268,17 +267,11 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
 
     raise ValueError("Unable to decode file. (For mp4/m4a, ffmpeg support may be required.)")
 
-def features_from_bytes(raw: bytes, ext: str, target_sr: int, max_secs: int, expected_cols: List[str]) -> Dict[str, float]:
-    y, sr = load_audio_any(raw, ext=ext, target_sr=target_sr, mono=True, max_secs=max_secs)
-    base = extract_features_array(y, sr)
-    # Add alias keys only if they help match expected columns
-    return add_aliases_to_match_expected(base, expected_cols)
-
-# --------- Prediction ---------
+# ---------- Prediction ----------
 def predict_dataframe(model, encoder, X: pd.DataFrame, top_k: int = 5):
-    X = align_columns_to_model(X, model)
+    expected = load_expected_features()
+    X = align_columns_to_expected(X, expected) if expected else X
     y_pred = model.predict(X)
-    # map numeric codes -> human labels
     labels = encoder.inverse_transform(y_pred.astype(int)) if np.issubdtype(np.array(y_pred).dtype, np.number) else y_pred.astype(str)
     out = pd.DataFrame({"pred_idx": y_pred, "pred_label": labels})
     if hasattr(model, "predict_proba"):
@@ -289,7 +282,7 @@ def predict_dataframe(model, encoder, X: pd.DataFrame, top_k: int = 5):
         out["top_probs"]  = [[float(proba[r, i]) for i in row] for r, row in enumerate(order)]
     return out
 
-def build_zip_by_genre(rows: List[Tuple[str, str, bytes]], preds_df: pd.DataFrame) -> bytes:
+def build_zip_by_genre(rows, preds_df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for genre, fname, fbytes in rows:
@@ -298,20 +291,21 @@ def build_zip_by_genre(rows: List[Tuple[str, str, bytes]], preds_df: pd.DataFram
     buf.seek(0)
     return buf.read()
 
-# --------- UI ---------
+# ---------- UI ----------
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • audio-only + feature-alignment")
+st.caption("Build 2025-08-18 • Beatport-92 feature mapping")
 
 with st.sidebar:
     st.header("Settings")
     model_path   = st.text_input("Model path", value=DEFAULT_MODEL_PATH)
     encoder_path = st.text_input("Encoder path", value=DEFAULT_ENCODER_PATH)
     target_sr    = st.selectbox("Target sample rate", [22050, 44100], index=0)
-    top_k        = st.number_input("Top-K probabilities", min_value=1, max_value=10, value=TOP_K_DEFAULT, step=1)
-    max_secs     = st.number_input("Analyze up to (seconds)", min_value=10, max_value=600, value=MAX_ANALYZE_SECONDS_DEFAULT, step=10)
+    top_k        = st.number_input("Top-K probabilities", 1, 10, TOP_K_DEFAULT, 1)
+    max_secs     = st.number_input("Analyze up to (seconds)", 10, 600, MAX_ANALYZE_SECONDS_DEFAULT, 10)
 
 model = load_model(model_path)
 encoder = load_encoder(encoder_path)
+expected_cols = load_expected_features()
 
 with st.expander("🔎 Debug: label map"):
     classes, names = get_display_names(model, encoder)
@@ -328,56 +322,47 @@ uploaded = st.file_uploader(
 )
 
 if uploaded:
-    expected_cols = list(getattr(model, "feature_names_in_", [])) or load_expected_features_fallback()
-
     items = []      # (name, raw, ext)
-    feat_rows = []  # dicts
+    rows = []       # feature dicts
     progress = st.progress(0)
     for i, f in enumerate(uploaded, start=1):
         raw = f.read()
         name = f.name
         ext  = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         try:
-            feats = features_from_bytes(raw, ext=ext, target_sr=int(target_sr), max_secs=int(max_secs), expected_cols=expected_cols)
-            feats["file_name"] = name
+            y, sr = load_audio_any(raw, ext=ext, target_sr=int(target_sr), mono=True, max_secs=int(max_secs))
+            # Build a row EXACTLY for expected columns (92 keys). Unknown keys -> NaN
+            if not expected_cols:
+                st.error("No expected feature list found on model or JSON; cannot build Beatport-92 features.")
+                st.stop()
+            row = build_beatport92_row(y, sr, expected_cols)
+            row["file_name"] = name
             items.append((name, raw, ext))
-            feat_rows.append(feats)
+            rows.append(row)
         except Exception as e:
             st.error(f"❌ {name}: {e}")
         progress.progress(i / len(uploaded))
     progress.empty()
 
-    if not feat_rows:
+    if not rows:
         st.error("No decodable files were uploaded.")
         st.stop()
 
-    df = pd.DataFrame(feat_rows).fillna(np.nan)
+    df = pd.DataFrame(rows).fillna(np.nan)
     file_names = df.pop("file_name").tolist()
 
-    # --- Diagnostics: feature coverage ---
-    coverage = None
-    with st.expander("🧪 Diagnostics: feature alignment & variability"):
+    # Diagnostics
+    with st.expander("🧪 Diagnostics: feature alignment"):
         if expected_cols:
-            present = [c for c in expected_cols if c in df.columns]
-            missing = [c for c in expected_cols if c not in df.columns]
-            coverage = len(present) / len(expected_cols)
+            present = [c for c in expected_cols if c in df.columns and df[c].notna().any()]
+            missing = [c for c in expected_cols if c not in df.columns]  # should be 0 now
+            coverage = len(present) / max(1, len(expected_cols))
             st.write(f"Expected features: {len(expected_cols)}")
-            st.write(f"Present in extracted DF: {len(present)}")
-            st.write(f"Missing: {len(missing)}")
+            st.write(f"Present (non-NaN) in DF: {len(present)}")
+            st.write(f"Missing keys: {len(missing)}")
             st.progress(coverage)
             if missing:
-                st.caption("First 50 missing feature names:")
                 st.code("\n".join(missing[:50]))
-            # Per-file variability (are inputs collapsing?)
-            if present:
-                show_cols = present[:20]
-                st.write("Per-file feature stats (first 20 overlapping columns):")
-                try:
-                    st.dataframe(df[show_cols].astype(float).describe().loc[["mean","std"]])
-                except Exception:
-                    st.dataframe(df[show_cols].describe().loc[["mean","std"]])
-        else:
-            st.info("Model has no feature_names_in_, and no JSON fallback was found.")
 
     try:
         preds = predict_dataframe(model, encoder, df, top_k=int(top_k))
@@ -402,10 +387,7 @@ if uploaded:
         )
 
         if preds["pred_label"].nunique(dropna=False) == 1:
-            if coverage is not None and coverage < 0.7:
-                st.warning("All predictions are the same and feature coverage is low. This strongly suggests a train/inference feature mismatch. The Diagnostics panel lists missing columns.")
-            else:
-                st.warning("All predictions are the same. Check class balance or feature mismatch in Diagnostics.")
+            st.warning("All predictions are the same. If coverage is high, this may be class imbalance in training.")
     except Exception as e:
         st.error("Prediction failed.")
         st.exception(e)
