@@ -1,10 +1,5 @@
-# app.py — MilkCrate (audio/video → genre folders → ZIP) with Beatport-92 features (incl. ΔMFCC)
-# Build: 2025-08-18 • beatport92-full
-# - Accepts audio (wav/mp3/flac/ogg/opus/m4a/aac/wma/aiff) and video (mp4/m4v/mov/webm/mkv)
-# - Computes Beatport-style 92 features by name (zcr/energy/energyentropy/spectral*/MFCC/ΔMFCC/Chroma)
-# - Maps numeric class codes -> human labels via your LabelEncoder
-# - Organizes ORIGINAL uploads into genre-named folders, offers ZIP
-# - Diagnostics show coverage per feature group
+# app.py — MilkCrate (audio/video → genre folders → ZIP) | Beatport-92 full + robust name parsing
+# Build: 2025-08-18 • beatport92-full-v2
 
 import io, os, re, json, zipfile, unicodedata, warnings, tempfile
 from typing import Dict, List, Tuple
@@ -50,7 +45,6 @@ def load_encoder(path: str):
         st.stop()
     return joblib.load(path)
 
-# Will be filled after model loads
 _model_feature_names: List[str] = []
 
 def load_expected_features() -> List[str]:
@@ -133,16 +127,18 @@ def safe_stat(series: np.ndarray, which: str) -> float:
     s = np.asarray(series, dtype=float)
     if which in ("m", "mean"):
         return float(np.nanmean(s)) if s.size else np.nan
-    else:  # "s" or "std"
+    else:
         return float(np.nanstd(s)) if s.size else np.nan
 
-# ---------- Beatport-92 row builder ----------
+# ---------- Beatport-92 row builder (robust name parsing) ----------
 def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[str, float]:
     """
-    Fill ALL expected keys. Handles suffixes 'm'/'s' and 'std', and groups:
-      zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff},
-      mfccs1..20, delta mfccs (dmfccs/deltamfccs) 1..20, chromas1..12.
-    Anything unknown -> NaN (imputer will handle a few, but goal is 92/92 non-NaN).
+    Handles:
+      - zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff} + {m|s}
+      - MFCC:      mfccs{N}{m|s|std}
+      - ΔMFCC:     dmfccs{N}{…} / deltamfccs{N}{…} / mfccs{N}d{…}
+      - Chroma:    chromas{N}{…} / chroma{N}{…} / chromagram{N}{…}
+    Any unknown key -> NaN (imputer can handle a few).
     """
     row: Dict[str, float] = {}
 
@@ -159,9 +155,9 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
     sflux = series_spec_flux(S)
     eent = series_energy_entropy(y, frame_len=n_fft, hop=hop, subframes=10)
 
-    # MFCC + ΔMFCC
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)  # (20, T)
-    dmfcc = librosa.feature.delta(mfcc, order=1)        # (20, T)
+    # MFCC + ΔMFCC (20 by default; training often used 13, that's fine)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)   # (20, T)
+    dmfcc = librosa.feature.delta(mfcc, order=1)         # (20, T)
 
     # Chroma (12, T)
     chroma = librosa.feature.chroma_stft(S=S, sr=sr)
@@ -170,7 +166,7 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
         # strip numeric prefix "NN-"
         base = re.sub(r"^\d+-", "", key)
 
-        # figure out stat suffix
+        # detect mean/std suffix
         stat_suffix = None
         if base.endswith(("std", "STD")):
             stat_suffix = "std"; base = base[:-3]
@@ -180,10 +176,7 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
             stat_suffix = "s"; base = base[:-1]
 
         val = np.nan
-
-        # normalize base aliases
-        b = base.lower()
-        b = b.replace("_", "").replace("-", "")
+        b = base.lower().replace("_","").replace("-","")
 
         # core groups
         if b == "zcr" and stat_suffix:
@@ -203,24 +196,27 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
         elif b in ("spectralrolloff","specrolloff") and stat_suffix:
             val = safe_stat(sro, "m" if stat_suffix=="m" else "s")
 
-        # MFCCs N and ΔMFCCs N (dmfccs/deltamfccs variants)
         else:
-            m1 = re.match(r"mfccs(\d+)$", b)
-            m2 = re.match(r"(?:dmfccs|deltamfccs)(\d+)$", b)
-            m3 = re.match(r"chromas(\d+)$", b)
+            # MFCC variants
+            m_dm1 = re.match(r"(?:dmfccs|deltamfccs)(\d+)$", b)   # dmfccs1, deltamfccs1
+            m_dm2 = re.match(r"mfccs(\d+)d$", b)                  # mfccs1d
+            m_mf  = re.match(r"mfccs(\d+)$", b)                   # mfccs1
 
-            if m1 and stat_suffix:
-                idx = int(m1.group(1)) - 1
-                if 0 <= idx < mfcc.shape[0]:
-                    val = safe_stat(mfcc[idx], "m" if stat_suffix=="m" else "s")
+            # Chroma variants
+            m_ch  = re.match(r"(?:chromas|chroma|chromagram|chromagrams)(\d+)$", b)
 
-            elif m2 and stat_suffix:
-                idx = int(m2.group(1)) - 1
+            if (m_dm1 or m_dm2) and stat_suffix:  # ΔMFCC
+                idx = int((m_dm1 or m_dm2).group(1)) - 1
                 if 0 <= idx < dmfcc.shape[0]:
                     val = safe_stat(dmfcc[idx], "m" if stat_suffix=="m" else "s")
 
-            elif m3 and stat_suffix:
-                idx = int(m3.group(1)) - 1
+            elif m_mf and stat_suffix:  # MFCC
+                idx = int(m_mf.group(1)) - 1
+                if 0 <= idx < mfcc.shape[0]:
+                    val = safe_stat(mfcc[idx], "m" if stat_suffix=="m" else "s")
+
+            elif m_ch and stat_suffix:  # Chroma
+                idx = int(m_ch.group(1)) - 1
                 if 0 <= idx < chroma.shape[0]:
                     val = safe_stat(chroma[idx], "m" if stat_suffix=="m" else "s")
 
@@ -272,7 +268,6 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
 
 # ---------- Prediction helpers ----------
 def predict_dataframe(model, encoder, X: pd.DataFrame, top_k: int = 5):
-    # align strictly to expected order
     expected = load_expected_features()
     X = X.reindex(columns=expected)
     y_pred = model.predict(X)
@@ -297,7 +292,7 @@ def build_zip_by_genre(rows, preds_df: pd.DataFrame) -> bytes:
 
 # ---------- UI ----------
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • beatport92-full")
+st.caption("Build 2025-08-18 • beatport92-full-v2 (ΔMFCC+Chroma parsing)")
 
 with st.sidebar:
     st.header("Settings")
@@ -353,8 +348,8 @@ if uploaded:
     file_names = df.pop("file_name").tolist()
 
     # ---- Diagnostics: coverage per group ----
-    def group_count(prefix_regex: str) -> int:
-        pat = re.compile(prefix_regex)
+    def present_count(regex: str) -> int:
+        pat = re.compile(regex)
         cols = [c for c in expected_cols if pat.search(re.sub(r'^\d+-','', c))]
         return int(np.sum([df[c].notna().any() for c in cols])) if cols else 0
 
@@ -364,12 +359,11 @@ if uploaded:
         st.write(f"Present (non-NaN) in DF: {present_any}")
         st.write(f"Missing keys: 0")
         st.progress(present_any / max(1, len(expected_cols)))
-        st.write("By group (non-NaN counts):")
         st.write({
-            "core (zcr/energy/entropy/spec*)": group_count(r'^(zcr|energy(entropy)?|spectral(centroid|spread|entropy|flux|rolloff))(m|s|std)?$'),
-            "MFCC": group_count(r'^mfccs\d+(m|s|std)?$'),
-            "ΔMFCC": group_count(r'^(dmfccs|deltamfccs)\d+(m|s|std)?$'),
-            "Chroma": group_count(r'^chromas\d+(m|s|std)?$'),
+            "core (zcr/energy/entropy/spec*)": present_count(r'^(zcr|energy(entropy)?|spectral(centroid|spread|entropy|flux|rolloff))(m|s|std)?$'),
+            "MFCC":   present_count(r'^mfccs\d+(m|s|std)?$'),
+            "ΔMFCC":  present_count(r'^(?:dmfccs|deltamfccs|mfccs\d+d)(m|s|std)?$'),
+            "Chroma": present_count(r'^(?:chromas|chroma|chromagram|chromagrams)\d+(m|s|std)?$'),
         })
 
     try:
@@ -396,7 +390,7 @@ if uploaded:
         )
 
         if preds["pred_label"].nunique(dropna=False) == 1 and present_any < len(expected_cols):
-            st.warning("All predictions are the same and many features were NaN. If this persists after this update, share a screenshot of the Diagnostics numbers so we can refine parsing further.")
+            st.warning("All predictions are the same and many features are NaN. If this persists, share the Diagnostics numbers so we can refine parsing further.")
     except Exception as e:
         st.error("Prediction failed.")
         st.exception(e)
