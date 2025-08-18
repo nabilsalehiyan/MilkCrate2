@@ -1,6 +1,10 @@
-# app.py — MilkCrate (audio/video → genre ZIP) with Beatport-92 feature mapping
-# This extractor emits columns like: "1-zcrm", "2-energym", "3-energyentropym", "9-mfccs1m", ...
-# so your model won't collapse to a single class.
+# app.py — MilkCrate (audio/video → genre folders → ZIP) with Beatport-92 features (incl. ΔMFCC)
+# Build: 2025-08-18 • beatport92-full
+# - Accepts audio (wav/mp3/flac/ogg/opus/m4a/aac/wma/aiff) and video (mp4/m4v/mov/webm/mkv)
+# - Computes Beatport-style 92 features by name (zcr/energy/energyentropy/spectral*/MFCC/ΔMFCC/Chroma)
+# - Maps numeric class codes -> human labels via your LabelEncoder
+# - Organizes ORIGINAL uploads into genre-named folders, offers ZIP
+# - Diagnostics show coverage per feature group
 
 import io, os, re, json, zipfile, unicodedata, warnings, tempfile
 from typing import Dict, List, Tuple
@@ -17,6 +21,7 @@ import audioread                    # backend for mp3/m4a/etc
 from moviepy.editor import AudioFileClip  # fallback for video containers
 
 warnings.filterwarnings("ignore")
+st.set_page_config(page_title="MilkCrate • Audio → Genre ZIP", layout="wide")
 
 # ---------- Config ----------
 DEFAULT_MODEL_PATH = "artifacts/beatport201611_hgb.joblib"
@@ -29,8 +34,6 @@ TOP_K_DEFAULT = 5
 
 SUPPORTED_AUDIO = {"wav","mp3","flac","ogg","oga","opus","m4a","aac","wma","aiff","aif","aifc"}
 SUPPORTED_VIDEO = {"mp4","m4v","mov","webm","mkv"}
-
-st.set_page_config(page_title="MilkCrate • Audio → Genre ZIP", layout="wide")
 
 # ---------- Loaders ----------
 @st.cache_resource(show_spinner=False)
@@ -47,11 +50,12 @@ def load_encoder(path: str):
         st.stop()
     return joblib.load(path)
 
+# Will be filled after model loads
+_model_feature_names: List[str] = []
+
 def load_expected_features() -> List[str]:
-    # Prefer model.feature_names_in_; fall back to JSON list (exact order matters)
-    names = list(getattr(model, "feature_names_in_", []))
-    if names:
-        return list(names)
+    if _model_feature_names:
+        return list(_model_feature_names)
     if os.path.exists(EXPECTED_FEATURES_JSON):
         try:
             with open(EXPECTED_FEATURES_JSON, "r") as f:
@@ -60,7 +64,8 @@ def load_expected_features() -> List[str]:
                 return cols
         except Exception:
             pass
-    return []
+    st.error("No expected feature list found on model or JSON; cannot build Beatport-92 features.")
+    st.stop()
 
 # ---------- Utils ----------
 def sanitize_filename(name: str) -> str:
@@ -68,12 +73,6 @@ def sanitize_filename(name: str) -> str:
     base = unicodedata.normalize("NFKD", base).encode("ascii","ignore").decode("ascii")
     base = re.sub(r"[^\w\-.]+","_", base).strip("._")
     return base or "audio"
-
-def align_columns_to_expected(df: pd.DataFrame, expected: List[str]) -> pd.DataFrame:
-    missing = [c for c in expected if c not in df.columns]
-    if missing:
-        st.warning(f"Input missing {len(missing)} of {len(expected)} expected columns. First few: {missing[:10]}")
-    return df.reindex(columns=expected)
 
 def get_display_names(model, encoder):
     classes = getattr(model, "classes_", None)
@@ -88,59 +87,62 @@ def get_display_names(model, encoder):
         return arr, names
     return arr, arr
 
-# ---------- Low-level feature helpers (framewise) ----------
-def frame_rms(y, hop=512, n_fft=2048):
-    return librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop)[0]
-
-def frame_zcr(y, hop=512):
-    return librosa.feature.zero_crossing_rate(y=y, hop_length=hop)[0]
-
+# ---------- Framewise primitives ----------
 def stft_mag(y, n_fft=2048, hop=512):
     return np.abs(librosa.stft(y=y, n_fft=n_fft, hop_length=hop))
 
-def spectral_centroid_series(S, sr):
+def series_zcr(y, hop=512):
+    return librosa.feature.zero_crossing_rate(y=y, hop_length=hop)[0]
+
+def series_rms(y, hop=512, n_fft=2048):
+    return librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop)[0]
+
+def series_centroid(S, sr):
     return librosa.feature.spectral_centroid(S=S, sr=sr)[0]
 
-def spectral_bandwidth_series(S, sr):
+def series_bandwidth(S, sr):
     return librosa.feature.spectral_bandwidth(S=S, sr=sr)[0]
 
-def spectral_rolloff_series(S, sr, roll=0.85):
+def series_rolloff(S, sr, roll=0.85):
     return librosa.feature.spectral_rolloff(S=S, sr=sr, roll_percent=roll)[0]
 
-def spectral_entropy_series(S, eps=1e-10):
-    # entropy per frame over frequency bins
+def series_spec_entropy(S, eps=1e-10):
     P = S / (S.sum(axis=0, keepdims=True) + eps)
-    ent = -np.sum(P * np.log(P + eps), axis=0)  # nats
-    return ent
+    return (-np.sum(P * np.log(P + eps), axis=0))
 
-def spectral_flux_series(S):
-    # positive flux between consecutive frames, L2-normed
+def series_spec_flux(S):
     Sn = S / (np.linalg.norm(S, axis=0, keepdims=True) + 1e-10)
     d = np.diff(Sn, axis=1)
     flux = np.sqrt((np.clip(d, 0, None)**2).sum(axis=0))
-    # align length with other framewise series by padding one NaN at start
     return np.concatenate([[np.nan], flux])
 
-def energy_entropy_series(y, frame_len=2048, hop=512, subframes=10, eps=1e-12):
-    # For each analysis frame, split it into 'subframes' segments and compute entropy of sub-energies
+def series_energy_entropy(y, frame_len=2048, hop=512, subframes=10, eps=1e-12):
     if len(y) < frame_len:
         y = np.pad(y, (0, frame_len - len(y)))
-    frames = librosa.util.frame(y, frame_length=frame_len, hop_length=hop).T  # shape: (n_frames, frame_len)
+    frames = librosa.util.frame(y, frame_length=frame_len, hop_length=hop).T
     ent = []
     seg_len = frame_len // subframes
     for fr in frames:
-        # split into equal segments
         segs = [fr[i*seg_len:(i+1)*seg_len] for i in range(subframes)]
         energies = np.array([np.sum(s**2) for s in segs], dtype=float)
         p = energies / (energies.sum() + eps)
         ent.append(-np.sum(p * np.log(p + eps)))
     return np.array(ent)
 
+def safe_stat(series: np.ndarray, which: str) -> float:
+    s = np.asarray(series, dtype=float)
+    if which in ("m", "mean"):
+        return float(np.nanmean(s)) if s.size else np.nan
+    else:  # "s" or "std"
+        return float(np.nanstd(s)) if s.size else np.nan
+
 # ---------- Beatport-92 row builder ----------
 def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[str, float]:
     """
-    Populate EXACT expected keys. We parse names like '1-zcrm', '2-energym', '9-mfccs1m', '33-mfccs1s', '57-chromas1m', etc.
-    If a key is unknown, we set NaN so the model's imputer can handle it.
+    Fill ALL expected keys. Handles suffixes 'm'/'s' and 'std', and groups:
+      zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff},
+      mfccs1..20, delta mfccs (dmfccs/deltamfccs) 1..20, chromas1..12.
+    Anything unknown -> NaN (imputer will handle a few, but goal is 92/92 non-NaN).
     """
     row: Dict[str, float] = {}
 
@@ -148,78 +150,79 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
     hop = 512
     n_fft = 2048
     S = stft_mag(y, n_fft=n_fft, hop=hop)
-    zcr = frame_zcr(y, hop=hop)
-    rms = frame_rms(y, hop=hop, n_fft=n_fft)
-    sc = spectral_centroid_series(S, sr)
-    sbw = spectral_bandwidth_series(S, sr)
-    sro = spectral_rolloff_series(S, sr, 0.85)
-    sent = spectral_entropy_series(S)
-    sflux = spectral_flux_series(S)
+    zcr = series_zcr(y, hop=hop)
+    rms = series_rms(y, hop=hop, n_fft=n_fft)
+    sc = series_centroid(S, sr)
+    sbw = series_bandwidth(S, sr)
+    sro = series_rolloff(S, sr, 0.85)
+    sent = series_spec_entropy(S)
+    sflux = series_spec_flux(S)
+    eent = series_energy_entropy(y, frame_len=n_fft, hop=hop, subframes=10)
 
-    # MFCCs (20)
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-    # Chroma STFT (12)
+    # MFCC + ΔMFCC
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)  # (20, T)
+    dmfcc = librosa.feature.delta(mfcc, order=1)        # (20, T)
+
+    # Chroma (12, T)
     chroma = librosa.feature.chroma_stft(S=S, sr=sr)
 
-    # Energy entropy (framewise)
-    eent = energy_entropy_series(y, frame_len=n_fft, hop=hop, subframes=10)
-
-    # Helper to fetch mean/std from a series, robust to NaNs
-    def stat(series, which: str):
-        s = np.asarray(series, dtype=float)
-        if which == "m":
-            return float(np.nanmean(s))
-        return float(np.nanstd(s))
-
-    # Map keys
     for key in expected_cols:
-        # Strip the numeric prefix "NN-"
-        name = re.sub(r"^\d+-", "", key)
+        # strip numeric prefix "NN-"
+        base = re.sub(r"^\d+-", "", key)
 
-        # Mean/Std suffix handling (final char m/s)
-        m_or_s = None
-        if name.endswith("m"):
-            m_or_s = "m"; base = name[:-1]
-        elif name.endswith("s"):
-            m_or_s = "s"; base = name[:-1]
+        # figure out stat suffix
+        stat_suffix = None
+        if base.endswith(("std", "STD")):
+            stat_suffix = "std"; base = base[:-3]
+        elif base.endswith("m"):
+            stat_suffix = "m"; base = base[:-1]
+        elif base.endswith("s"):
+            stat_suffix = "s"; base = base[:-1]
+
+        val = np.nan
+
+        # normalize base aliases
+        b = base.lower()
+        b = b.replace("_", "").replace("-", "")
+
+        # core groups
+        if b == "zcr" and stat_suffix:
+            val = safe_stat(zcr, "m" if stat_suffix=="m" else "s")
+        elif b == "energy" and stat_suffix:
+            val = safe_stat(rms, "m" if stat_suffix=="m" else "s")
+        elif b in ("energyentropy","energyent") and stat_suffix:
+            val = safe_stat(eent, "m" if stat_suffix=="m" else "s")
+        elif b in ("spectralcentroid","speccentroid") and stat_suffix:
+            val = safe_stat(sc, "m" if stat_suffix=="m" else "s")
+        elif b in ("spectralspread","specspread") and stat_suffix:
+            val = safe_stat(sbw, "m" if stat_suffix=="m" else "s")
+        elif b in ("spectralentropy","specentropy") and stat_suffix:
+            val = safe_stat(sent, "m" if stat_suffix=="m" else "s")
+        elif b in ("spectralflux","specflux") and stat_suffix:
+            val = safe_stat(sflux, "m" if stat_suffix=="m" else "s")
+        elif b in ("spectralrolloff","specrolloff") and stat_suffix:
+            val = safe_stat(sro, "m" if stat_suffix=="m" else "s")
+
+        # MFCCs N and ΔMFCCs N (dmfccs/deltamfccs variants)
         else:
-            base = name
+            m1 = re.match(r"mfccs(\d+)$", b)
+            m2 = re.match(r"(?:dmfccs|deltamfccs)(\d+)$", b)
+            m3 = re.match(r"chromas(\d+)$", b)
 
-        val = np.nan  # default if unknown
-
-        # --- Single-feature bases ---
-        if base == "zcr" and m_or_s:
-            val = stat(zcr, m_or_s)
-        elif base == "energy" and m_or_s:
-            val = stat(rms, m_or_s)  # using RMS as energy proxy
-        elif base == "energyentropy" and m_or_s:
-            val = stat(eent, m_or_s)
-        elif base == "spectralcentroid" and m_or_s:
-            val = stat(sc, m_or_s)
-        elif base == "spectralspread" and m_or_s:
-            val = stat(sbw, m_or_s)
-        elif base == "spectralentropy" and m_or_s:
-            val = stat(sent, m_or_s)
-        elif base == "spectralflux" and m_or_s:
-            val = stat(sflux, m_or_s)
-        elif base == "spectralrolloff" and m_or_s:
-            val = stat(sro, m_or_s)
-
-        # --- MFCCs: mfccs{1..20}{m|s} ---
-        elif base.startswith("mfccs") and m_or_s:
-            m = re.match(r"mfccs(\d+)$", base)
-            if m:
-                idx = int(m.group(1)) - 1
+            if m1 and stat_suffix:
+                idx = int(m1.group(1)) - 1
                 if 0 <= idx < mfcc.shape[0]:
-                    val = stat(mfcc[idx], m_or_s)
+                    val = safe_stat(mfcc[idx], "m" if stat_suffix=="m" else "s")
 
-        # --- Chroma: chromas{1..12}{m|s} ---
-        elif base.startswith("chromas") and m_or_s:
-            m = re.match(r"chromas(\d+)$", base)
-            if m:
-                idx = int(m.group(1)) - 1
+            elif m2 and stat_suffix:
+                idx = int(m2.group(1)) - 1
+                if 0 <= idx < dmfcc.shape[0]:
+                    val = safe_stat(dmfcc[idx], "m" if stat_suffix=="m" else "s")
+
+            elif m3 and stat_suffix:
+                idx = int(m3.group(1)) - 1
                 if 0 <= idx < chroma.shape[0]:
-                    val = stat(chroma[idx], m_or_s)
+                    val = safe_stat(chroma[idx], "m" if stat_suffix=="m" else "s")
 
         row[key] = float(val) if np.isfinite(val) else np.nan
 
@@ -227,7 +230,7 @@ def build_beatport92_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Di
 
 # ---------- Decode audio or extract from video ----------
 def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_secs: int = 120) -> Tuple[np.ndarray, int]:
-    # 1) soundfile (wav/flac/ogg/aiff)
+    # 1) soundfile
     try:
         with io.BytesIO(raw) as bio:
             data, sr = sf.read(bio, dtype="float32", always_2d=False)
@@ -242,7 +245,7 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
     except Exception:
         pass
 
-    # 2) librosa/audioread via temp file (mp3/m4a/etc.)
+    # 2) librosa/audioread via temp file
     try:
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=True) as tmp:
             tmp.write(raw); tmp.flush()
@@ -251,7 +254,7 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
     except Exception:
         pass
 
-    # 3) video containers via moviepy
+    # 3) video via moviepy
     if ext.lower() in SUPPORTED_VIDEO:
         try:
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=True) as vtmp, \
@@ -267,10 +270,11 @@ def load_audio_any(raw: bytes, ext: str, target_sr: int, mono: bool = True, max_
 
     raise ValueError("Unable to decode file. (For mp4/m4a, ffmpeg support may be required.)")
 
-# ---------- Prediction ----------
+# ---------- Prediction helpers ----------
 def predict_dataframe(model, encoder, X: pd.DataFrame, top_k: int = 5):
+    # align strictly to expected order
     expected = load_expected_features()
-    X = align_columns_to_expected(X, expected) if expected else X
+    X = X.reindex(columns=expected)
     y_pred = model.predict(X)
     labels = encoder.inverse_transform(y_pred.astype(int)) if np.issubdtype(np.array(y_pred).dtype, np.number) else y_pred.astype(str)
     out = pd.DataFrame({"pred_idx": y_pred, "pred_label": labels})
@@ -293,7 +297,7 @@ def build_zip_by_genre(rows, preds_df: pd.DataFrame) -> bytes:
 
 # ---------- UI ----------
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • Beatport-92 feature mapping")
+st.caption("Build 2025-08-18 • beatport92-full")
 
 with st.sidebar:
     st.header("Settings")
@@ -305,7 +309,7 @@ with st.sidebar:
 
 model = load_model(model_path)
 encoder = load_encoder(encoder_path)
-expected_cols = load_expected_features()
+_model_feature_names = list(getattr(model, "feature_names_in_", []))  # capture for load_expected_features()
 
 with st.expander("🔎 Debug: label map"):
     classes, names = get_display_names(model, encoder)
@@ -314,7 +318,6 @@ with st.expander("🔎 Debug: label map"):
 
 st.markdown("---")
 st.subheader("Upload files (audio or video)")
-
 uploaded = st.file_uploader(
     "Drop as many files as you want",
     type=sorted(list(SUPPORTED_AUDIO | SUPPORTED_VIDEO)),
@@ -322,19 +325,17 @@ uploaded = st.file_uploader(
 )
 
 if uploaded:
-    items = []      # (name, raw, ext)
-    rows = []       # feature dicts
+    expected_cols = load_expected_features()
+    items = []
+    rows = []
     progress = st.progress(0)
+
     for i, f in enumerate(uploaded, start=1):
         raw = f.read()
         name = f.name
         ext  = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         try:
             y, sr = load_audio_any(raw, ext=ext, target_sr=int(target_sr), mono=True, max_secs=int(max_secs))
-            # Build a row EXACTLY for expected columns (92 keys). Unknown keys -> NaN
-            if not expected_cols:
-                st.error("No expected feature list found on model or JSON; cannot build Beatport-92 features.")
-                st.stop()
             row = build_beatport92_row(y, sr, expected_cols)
             row["file_name"] = name
             items.append((name, raw, ext))
@@ -351,18 +352,25 @@ if uploaded:
     df = pd.DataFrame(rows).fillna(np.nan)
     file_names = df.pop("file_name").tolist()
 
-    # Diagnostics
+    # ---- Diagnostics: coverage per group ----
+    def group_count(prefix_regex: str) -> int:
+        pat = re.compile(prefix_regex)
+        cols = [c for c in expected_cols if pat.search(re.sub(r'^\d+-','', c))]
+        return int(np.sum([df[c].notna().any() for c in cols])) if cols else 0
+
+    present_any = int(np.sum([df[c].notna().any() for c in expected_cols]))
     with st.expander("🧪 Diagnostics: feature alignment"):
-        if expected_cols:
-            present = [c for c in expected_cols if c in df.columns and df[c].notna().any()]
-            missing = [c for c in expected_cols if c not in df.columns]  # should be 0 now
-            coverage = len(present) / max(1, len(expected_cols))
-            st.write(f"Expected features: {len(expected_cols)}")
-            st.write(f"Present (non-NaN) in DF: {len(present)}")
-            st.write(f"Missing keys: {len(missing)}")
-            st.progress(coverage)
-            if missing:
-                st.code("\n".join(missing[:50]))
+        st.write(f"Expected features: {len(expected_cols)}")
+        st.write(f"Present (non-NaN) in DF: {present_any}")
+        st.write(f"Missing keys: 0")
+        st.progress(present_any / max(1, len(expected_cols)))
+        st.write("By group (non-NaN counts):")
+        st.write({
+            "core (zcr/energy/entropy/spec*)": group_count(r'^(zcr|energy(entropy)?|spectral(centroid|spread|entropy|flux|rolloff))(m|s|std)?$'),
+            "MFCC": group_count(r'^mfccs\d+(m|s|std)?$'),
+            "ΔMFCC": group_count(r'^(dmfccs|deltamfccs)\d+(m|s|std)?$'),
+            "Chroma": group_count(r'^chromas\d+(m|s|std)?$'),
+        })
 
     try:
         preds = predict_dataframe(model, encoder, df, top_k=int(top_k))
@@ -375,7 +383,8 @@ if uploaded:
             package_rows.append((str(prow["pred_label"]), orig_name, raw))
 
         cols = ["file_name", "pred_label", "pred_idx"]
-        if "top_labels" in preds.columns: cols += ["top_labels", "top_probs"]
+        if "top_labels" in preds.columns:
+            cols += ["top_labels", "top_probs"]
         zip_bytes = build_zip_by_genre(package_rows, preds[cols])
 
         st.download_button(
@@ -386,8 +395,8 @@ if uploaded:
             use_container_width=True
         )
 
-        if preds["pred_label"].nunique(dropna=False) == 1:
-            st.warning("All predictions are the same. If coverage is high, this may be class imbalance in training.")
+        if preds["pred_label"].nunique(dropna=False) == 1 and present_any < len(expected_cols):
+            st.warning("All predictions are the same and many features were NaN. If this persists after this update, share a screenshot of the Diagnostics numbers so we can refine parsing further.")
     except Exception as e:
         st.error("Prediction failed.")
         st.exception(e)
