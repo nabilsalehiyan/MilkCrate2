@@ -73,3 +73,5 @@ dataset1/
 artifacts/*.joblib
 !artifacts/model_rf.joblib
 !artifacts/label_encoder.joblib
+!artifacts/model_version1beatport.joblib
+!artifacts/label_encoder.joblib

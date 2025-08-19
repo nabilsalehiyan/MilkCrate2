@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="MilkCrate • Audio → Genre ZIP", layout="wide")
 
 # ---------- Config ----------
-DEFAULT_MODEL_PATH = "artifacts/model_rf.joblib"
+DEFAULT_MODEL_PATH = "artifacts/model_version1beatport.joblib"
 DEFAULT_ENCODER_PATH = "artifacts/label_encoder.joblib"
 EXPECTED_FEATURES_JSON = "artifacts/beatport201611_feature_columns.json"  # optional fallback
 
