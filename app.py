@@ -74,7 +74,8 @@ def _safe_joblib_load(path: str):
                 return super().find_class(module, name)
 
         with open(path, "rb") as f:
-            return _ShimUnpickler(f, mmap_mode=None).load()
+            # IMPORTANT: NumpyUnpickler expects (filename, file_handle, mmap_mode)
+            return _ShimUnpickler(path, f, mmap_mode=None).load()
 
 
 # ============== Cached resources ==============
