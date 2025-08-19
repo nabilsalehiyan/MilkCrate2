@@ -1,5 +1,5 @@
 # app.py — MilkCrate: drop audio/video → genre-organized ZIP
-# Build 2025-08-18 • portable loader with custom Unpickler for legacy NumPy RNG pickles
+# Build 2025-08-18 • MFCC13 + ΔMFCC13 + chroma • plain joblib.load (NumPy pinned)
 
 from __future__ import annotations
 
@@ -28,63 +28,13 @@ DEFAULT_MAX_SECS     = 120
 
 st.set_page_config(page_title="MilkCrate — Drop audio/video → genre-organized ZIP", layout="wide")
 
-
-# ============== Robust loader (no NumPy monkey-patching) ==============
-def _safe_joblib_load(path: str):
-    """
-    First try normal joblib.load. If the pickle references legacy NumPy RNG
-    classes (BitGenerator / PCG64 / MT19937 / Philox / SFC64) that error on
-    modern NumPy, re-load using a custom Unpickler that maps those classes to
-    lightweight Python stubs. (Inference never needs RNG state.)
-    """
-    try:
-        return joblib.load(path)
-    except Exception as e:
-        msg = str(e)
-        needs_shim = any(k in msg for k in (
-            "BitGenerator", "bit_generator", "numpy.random._pickle", "is not a known BitGenerator"
-        ))
-        if not needs_shim:
-            raise
-
-        # Fallback: custom Unpickler that remaps RNG classes to Python stubs
-        from joblib.numpy_pickle import NumpyUnpickler
-
-        class _BitGenStub:
-            def __init__(self, *a, **k):
-                self.state = {}
-            def __setstate__(self, state):
-                # accept tuple or dict payloads from older pickles
-                if isinstance(state, tuple):
-                    if len(state) == 2 and isinstance(state[1], dict):
-                        state = state[1]
-                    elif len(state) == 1 and isinstance(state[0], dict):
-                        state = state[0]
-                    else:
-                        state = {"state": state}
-                self.state = state
-            def __getstate__(self):
-                return self.state
-
-        class _ShimUnpickler(NumpyUnpickler):
-            def find_class(self, module, name):
-                if module.startswith("numpy.random"):
-                    if name in {"BitGenerator", "PCG64", "MT19937", "Philox", "SFC64"}:
-                        return _BitGenStub
-                return super().find_class(module, name)
-
-        with open(path, "rb") as f:
-            # IMPORTANT: NumpyUnpickler expects (filename, file_handle, mmap_mode)
-            return _ShimUnpickler(path, f, mmap_mode=None).load()
-
-
 # ============== Cached resources ==============
 @st.cache_resource(show_spinner=False)
 def load_model(path: str):
     if not os.path.exists(path):
         st.error(f"Model not found: {path}")
         st.stop()
-    return _safe_joblib_load(path)
+    return joblib.load(path)
 
 @st.cache_resource(show_spinner=False)
 def load_encoder(path: str):
@@ -92,7 +42,6 @@ def load_encoder(path: str):
         st.error(f"Encoder not found: {path}")
         st.stop()
     return joblib.load(path)
-
 
 # ============== Audio/video decoding ==============
 def _tmp_from_uploader(uploaded) -> str:
@@ -129,7 +78,6 @@ def load_audio_any(path: str, target_sr: int, max_secs: int) -> Tuple[np.ndarray
         return y, target_sr
     except Exception as e:
         raise RuntimeError(f"Could not decode audio: {e}")
-
 
 # ============== Feature extraction ==============
 def _safe_mean_std(X: np.ndarray) -> Tuple[float, float]:
@@ -212,7 +160,6 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
 
     return feats
 
-
 # ============== Alignment & prediction ==============
 _PREFIX_RE = re.compile(r"^\d+-")
 def _strip_prefix(c: str) -> str: return _PREFIX_RE.sub("", c)
@@ -221,11 +168,14 @@ def align_features_for_model(feat_dict: Dict[str, float], model_cols: List[str])
     row = {col: feat_dict.get(_strip_prefix(col), np.nan) for col in model_cols}
     return pd.DataFrame([row], columns=model_cols)
 
-def predict_one(path: str, model, encoder, sr: int, max_secs: int, model_cols: List[str], top_k: int):
+def load_audio_features(path: str, sr: int, max_secs: int, model_cols: List[str]) -> Tuple[pd.DataFrame, Dict[str, float]]:
     y, _ = load_audio_any(path, sr, max_secs)
     feats = extract_features(y, sr)
     X = align_features_for_model(feats, model_cols)
+    return X, feats
 
+def predict_one(path: str, model, encoder, sr: int, max_secs: int, model_cols: List[str], top_k: int):
+    X, feats = load_audio_features(path, sr, max_secs, model_cols)
     pred_idx = int(model.predict(X)[0])
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X)[0]
@@ -239,7 +189,6 @@ def predict_one(path: str, model, encoder, sr: int, max_secs: int, model_cols: L
     pred_label = str(encoder.inverse_transform([pred_idx])[0])
     return os.path.basename(path), pred_idx, pred_label, top_labels, top_probs, feats
 
-
 def make_zip(rows: List[Tuple[str, str, bytes]]) -> bytes:
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -249,10 +198,9 @@ def make_zip(rows: List[Tuple[str, str, bytes]]) -> bytes:
     mem.seek(0)
     return mem.read()
 
-
 # ============== UI ==============
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • portable loader with custom Unpickler for legacy NumPy RNG pickles")
+st.caption("Build 2025-08-18 • plain joblib.load with pinned NumPy 1.26.4")
 
 with st.sidebar:
     st.header("Settings")
@@ -302,7 +250,6 @@ if uploaded:
                     "top_probs": ", ".join(f"{x:.6f}" for x in top_probs),
                 })
                 zip_rows.append((pred_label, base, file_bytes[p]))
-                # crude group counts
                 for k in feats:
                     lk = k.lower()
                     if lk.startswith(("zcr","energy","spectral")): diag_groups["core"] += 1
@@ -321,7 +268,6 @@ if uploaded:
     with st.expander("📝 Diagnostics: feature alignment", expanded=True):
         if model_cols:
             st.write(f"Expected features: {len(model_cols)}")
-            # quick coverage check on last file
             y, _ = load_audio_any(tmp_paths[-1], int(tgt_sr), int(max_secs))
             last = extract_features(y, int(tgt_sr))
             present = sum(np.isfinite(last.get(re.sub(r'^\d+-','', c), np.nan)) for c in model_cols)
