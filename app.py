@@ -1,5 +1,5 @@
 # app.py — MilkCrate: drop audio/video → genre-organized ZIP
-# Build 2025-08-18 • RNG-safe unpickler + 92-col aliasing + alignment debugger
+# Build 2025-08-18 • RNG-safe unpickler + 92-col aliasing + BEATS loudness band ratio (24 feats)
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import joblib
 
 # Audio stack
 import librosa
-import soundfile as sf  # noqa: F401 (used by librosa)
+import soundfile as sf  # noqa: F401
 
 # ================= Defaults =================
 DEFAULT_MODEL_PATH   = "artifacts/model_version1beatport.joblib"   # 92-col model
@@ -31,10 +31,6 @@ st.set_page_config(page_title="MilkCrate — Drop audio/video → genre-organize
 
 # ================= Robust loader (intercept NumPy RNG pickle ctors/classes) =================
 def _safe_joblib_load(path: str):
-    """
-    Try normal joblib.load; on RNG pickle errors, re-load with a custom Unpickler that
-    intercepts numpy.random constructors and classes, returning harmless Python stubs.
-    """
     try:
         return joblib.load(path)
     except Exception as e:
@@ -49,17 +45,12 @@ def _safe_joblib_load(path: str):
         from joblib.numpy_pickle import NumpyUnpickler
 
         class _GenStub:
-            """Minimal stand-in for np.random.Generator / RandomState / BitGenerator."""
-            def __init__(self, *a, **k):
-                self.state = {}
+            def __init__(self, *a, **k): self.state = {}
             def __setstate__(self, state):
                 if isinstance(state, tuple):
-                    if len(state) == 2 and isinstance(state[1], dict):
-                        state = state[1]
-                    elif len(state) == 1 and isinstance(state[0], dict):
-                        state = state[0]
-                    else:
-                        state = {"state": state}
+                    if len(state) == 2 and isinstance(state[1], dict): state = state[1]
+                    elif len(state) == 1 and isinstance(state[0], dict): state = state[0]
+                    else: state = {"state": state}
                 self.state = state
             def __getstate__(self): return self.state
             def random(self, *a, **k): return 0.5
@@ -113,7 +104,6 @@ def _tmp_from_uploader(uploaded) -> str:
     return path
 
 def load_audio_any(path: str, target_sr: int, max_secs: int) -> Tuple[np.ndarray, int]:
-    """Load mono audio at target_sr from audio or video containers."""
     try:
         y, sr = librosa.load(path, sr=target_sr, mono=True, duration=max_secs)
         return y, sr
@@ -135,22 +125,98 @@ def load_audio_any(path: str, target_sr: int, max_secs: int) -> Tuple[np.ndarray
         raise RuntimeError(f"Could not decode audio: {e}")
 
 
-# ================= Feature extraction =================
+# ================= Feature helpers =================
 def _safe_mean_std(X: np.ndarray) -> Tuple[float, float]:
     if X.size == 0 or np.all(~np.isfinite(X)):
         return float("nan"), float("nan")
     return float(np.nanmean(X)), float(np.nanstd(X))
 
+def _beat_boundaries(y: np.ndarray, sr: int, hop: int, n_frames: int) -> List[Tuple[int, int]]:
+    """Return list of (start_frame, end_frame_exclusive) beat bins; fallback to ~0.5s bins."""
+    try:
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop, units="frames")
+        beats = np.asarray(beats, int)
+        if beats.size >= 2:
+            starts = beats
+            ends = np.r_[beats[1:], n_frames]
+            pairs = [(int(s), int(e)) for s, e in zip(starts, ends) if e > s]
+            if pairs:
+                return pairs
+    except Exception:
+        pass
+    # Fallback: fixed windows ~0.5s
+    step = int(round(0.5 * sr / hop))
+    starts = np.arange(0, n_frames, step, dtype=int)
+    ends = np.r_[starts[1:], n_frames]
+    return [(int(s), int(e)) for s, e in zip(starts, ends) if e > s]
+
+def _compute_beats_loudness_band_ratio(y: np.ndarray, sr: int, S_power: np.ndarray, hop: int) -> Dict[str, float]:
+    """
+    12 log-spaced bands (20 Hz .. Nyquist). For each beat:
+      band_ratio_j = sum_power_in_band_j / sum_power_full
+    Then mean & stdev across beats → 24 features with names the model expects.
+    """
+    n_fft = 2048
+    n_frames = S_power.shape[1]
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    nyq = sr / 2.0
+    f_min = 20.0
+    # 12 log bands
+    edges = np.geomspace(f_min, nyq, num=13)
+    band_bins = []
+    for j in range(12):
+        lo, hi = edges[j], edges[j+1]
+        idx = np.where((freqs >= lo) & (freqs < hi))[0]
+        if idx.size == 0:  # guarantee at least one bin
+            idx = np.array([np.argmin(np.abs(freqs - (lo + hi) / 2.0))])
+        band_bins.append(idx)
+
+    beats = _beat_boundaries(y, sr, hop, n_frames)
+    if not beats:
+        return {f"beats_loudness_band_ratio.mean{j}": float("nan") for j in range(1,13)} | \
+               {f"beats_loudness_band_ratio.stdev{j}": float("nan") for j in range(1,13)}
+
+    eps = 1e-10
+    full_power = S_power.sum(axis=0) + eps
+
+    # Per-beat ratios per band
+    ratios = [[] for _ in range(12)]
+    for s, e in beats:
+        s = max(0, min(s, n_frames-1))
+        e = max(s+1, min(e, n_frames))
+        denom = float(full_power[s:e].mean())
+        if not np.isfinite(denom) or denom <= 0:
+            # skip impossible window
+            continue
+        for j in range(12):
+            band_pow = S_power[band_bins[j], s:e].mean()
+            ratios[j].append(float(band_pow / denom))
+
+    feats = {}
+    for j in range(12):
+        arr = np.asarray(ratios[j], float)
+        if arr.size == 0:
+            m, s = float("nan"), float("nan")
+        else:
+            m, s = float(np.nanmean(arr)), float(np.nanstd(arr))
+        feats[f"beats_loudness_band_ratio.mean{j+1}"]  = m
+        feats[f"beats_loudness_band_ratio.stdev{j+1}"] = s
+    return feats
+
+
+# ================= Feature extraction =================
 def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
     """
-    Core (zcr/energy/entropy/spec* + flux/rolloff) + MFCC13 + ΔMFCC13 + chroma(12) + chroma deviation.
-    Names are unprefixed; we align to model columns later.
+    Core (zcr/energy/entropy/spec* + flux/rolloff) + MFCC13 + ΔMFCC13 + chroma(12) + chroma deviation
+    + beats_loudness_band_ratio.{mean1..12, stdev1..12}
     """
     n_fft = 2048
     hop = 512
     feats: Dict[str, float] = {}
 
+    # STFT
     S = np.abs(librosa.stft(y=y, n_fft=n_fft, hop_length=hop)) + 1e-12
+    S_power = (S * S)
 
     # Core
     zcr   = librosa.feature.zero_crossing_rate(y, frame_length=n_fft, hop_length=hop).squeeze()
@@ -184,9 +250,9 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
         feats[name] = m
         feats[name.replace("m", "std", 1) if name.endswith("m") else f"{name}std"] = s
 
-    m, s = _safe_mean_std(eent);  feats["energyentropym"]    = m; feats["energyentropystd"] = s
+    m, s = _safe_mean_std(eent);  feats["energyentropym"]    = m; feats["energyentropystd"]   = s
     m, s = _safe_mean_std(sent);  feats["spectralentropym"]  = m; feats["spectralentropystd"] = s
-    m, s = _safe_mean_std(sflux); feats["spectralfluxm"]     = m; feats["spectralfluxstd"] = s
+    m, s = _safe_mean_std(sflux); feats["spectralfluxm"]     = m; feats["spectralfluxstd"]    = s
 
     # MFCC 13
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, n_fft=n_fft, hop_length=hop)
@@ -213,6 +279,9 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
     feats["chromadeviationm"]   = m
     feats["chromadeviationstd"] = s
 
+    # NEW: beats loudness band ratios (24 features)
+    feats.update(_compute_beats_loudness_band_ratio(y, sr, S_power=S_power, hop=hop))
+
     return feats
 
 
@@ -220,7 +289,7 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
 _PREFIX_RE = re.compile(r"^\d+-")
 def _strip_prefix(c: str) -> str: return _PREFIX_RE.sub("", c)
 
-# ---- Alias map: normalize ΔMFCC/core/chroma variants to extractor keys ----
+# Aliases (ΔMFCC/core/chroma variants)
 _DMFFC_ALIASES: Dict[str, str] = {}
 for i in range(1, 14):
     _DMFFC_ALIASES[f"delta_mfccs{i}m"]   = f"amfccs{i}m"
@@ -257,19 +326,13 @@ _CHROMA_ALIASES.update({
 })
 
 def _alias_key(key: str, feats: Dict[str, float]) -> Tuple[str, float]:
-    """Return (resolved_key, value) after trying aliases; NaN if nothing found."""
-    # direct
-    if key in feats and np.isfinite(feats[key]):
-        return key, feats[key]
-    # ΔMFCC
+    if key in feats and np.isfinite(feats[key]): return key, feats[key]
     if key in _DMFFC_ALIASES:
         k = _DMFFC_ALIASES[key]
         if k in feats and np.isfinite(feats[k]): return k, feats[k]
-    # core
     if key in _CORE_ALIASES:
         k = _CORE_ALIASES[key]
         if k in feats and np.isfinite(feats[k]): return k, feats[k]
-    # chroma
     if key in _CHROMA_ALIASES:
         k = _CHROMA_ALIASES[key]
         if k in feats and np.isfinite(feats[k]): return k, feats[k]
@@ -279,7 +342,6 @@ def align_features_for_model(feat_dict: Dict[str, float], model_cols: List[str])
     row = {}
     for col in model_cols:
         key = _strip_prefix(col)
-        # exact or alias
         if key in feat_dict and np.isfinite(feat_dict[key]):
             val = feat_dict[key]
         else:
@@ -326,7 +388,7 @@ def make_zip(rows: List[Tuple[str, str, bytes]]) -> bytes:
 
 # ================= UI =================
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • 92-col aliasing & alignment debugger (ΔMFCC/core/chroma variants)")
+st.caption("Build 2025-08-18 • MFCC13 + ΔMFCC13 + chroma + core + beats_loudness_band_ratio (24) • RNG pickle shim")
 st.write(f"🔎 Runtime — NumPy: **{np.__version__}**, joblib: **{joblib.__version__}**, pandas: **{pd.__version__}**")
 
 with st.sidebar:
@@ -342,7 +404,6 @@ model   = load_model(model_path)
 encoder = load_encoder(encoder_path)
 model_cols: List[str] = list(getattr(model, "feature_names_in_", []))
 
-# Model feature inventory (to see what it expects by group)
 with st.expander("📦 Model feature inventory"):
     if model_cols:
         counts = {"core":0, "MFCC":0, "ΔMFCC":0, "Chroma":0}
@@ -361,7 +422,7 @@ uploaded = st.file_uploader(
     "Drag and drop files here",
     type=None,
     accept_multiple_files=True,
-    help="Any common audio/video: mp3, wav, aiff, m4a, mp4, mov, mkv, ogg, opus, flac, webm, etc."
+    help="Any common audio/video: mp3, wav, aiff, flac, ogg, opus, m4a, mp4, mov, mkv, webm…"
 )
 
 if uploaded:
@@ -400,7 +461,7 @@ if uploaded:
                     "top_probs": "",
                 })
 
-    # Alignment diagnostics against the **aligned row** actually fed to the model
+    # Alignment diagnostics against the aligned row
     with st.expander("📝 Diagnostics: feature alignment", expanded=True):
         if model_cols and last_X is not None:
             mask = np.isfinite(last_X.iloc[0].to_numpy())
@@ -408,7 +469,6 @@ if uploaded:
             st.write(f"Expected features: {len(model_cols)}")
             st.write(f"Present (non-NaN) in DF: {present}")
 
-            # Missing list (first 30) with suggested alias key & availability
             missing_cols = [c for c, ok in zip(model_cols, mask) if not ok]
             if missing_cols:
                 show = []
@@ -426,7 +486,7 @@ if uploaded:
                     })
                 st.write("Missing columns (first 30) with alias probe:")
                 st.dataframe(pd.DataFrame(show), use_container_width=True, hide_index=True)
-            # Group breakdown based on model columns actually missing/present
+
             by_group = {"core":0, "MFCC":0, "ΔMFCC":0, "Chroma":0}
             for c, ok in zip(model_cols, mask):
                 if ok: by_group[_group_of(c)] += 1
@@ -438,7 +498,6 @@ if uploaded:
     st.subheader("Predictions")
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # Build ZIP (organized by predicted label)
     ok_rows = [(r["pred_label"], r["file_name"], file_bytes[p])
                for r, p in zip(rows, tmp_paths) if not r["pred_label"].startswith("ERROR:")]
     if ok_rows:
