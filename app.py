@@ -1,5 +1,5 @@
 # app.py — MilkCrate: drop audio/video → genre-organized ZIP
-# Build 2025-08-18 • RNG-safe unpickler + 92-col feature aliasing (Option B)
+# Build 2025-08-18 • RNG-safe unpickler + 92-col aliasing + alignment debugger
 
 from __future__ import annotations
 
@@ -20,8 +20,7 @@ import librosa
 import soundfile as sf  # noqa: F401 (used by librosa)
 
 # ================= Defaults =================
-# Option B: keep the 92-feature model and align by aliasing ΔMFCC/etc.
-DEFAULT_MODEL_PATH   = "artifacts/model_version1beatport.joblib"
+DEFAULT_MODEL_PATH   = "artifacts/model_version1beatport.joblib"   # 92-col model
 DEFAULT_ENCODER_PATH = "artifacts/label_encoder.joblib"
 DEFAULT_SR           = 22050
 DEFAULT_TOPK         = 5
@@ -54,7 +53,6 @@ def _safe_joblib_load(path: str):
             def __init__(self, *a, **k):
                 self.state = {}
             def __setstate__(self, state):
-                # accept tuples or dicts from legacy pickles
                 if isinstance(state, tuple):
                     if len(state) == 2 and isinstance(state[1], dict):
                         state = state[1]
@@ -63,26 +61,21 @@ def _safe_joblib_load(path: str):
                     else:
                         state = {"state": state}
                 self.state = state
-            def __getstate__(self):
-                return self.state
-            # scikit-learn never calls RNG methods at predict-time, but be safe:
+            def __getstate__(self): return self.state
             def random(self, *a, **k): return 0.5
             def randint(self, *a, **k): return 0
 
-        # No-op factories that return an *instance* immediately
-        def _noop_gen_ctor(*_a, **_k) -> _GenStub: return _GenStub()
-        def _noop_rs_ctor(*_a, **_k) -> _GenStub:  return _GenStub()
-        def _noop_bg_ctor(*_a, **_k) -> _GenStub:  return _GenStub()
+        def _noop_gen_ctor(*_a, **_k): return _GenStub()
+        def _noop_rs_ctor(*_a, **_k):  return _GenStub()
+        def _noop_bg_ctor(*_a, **_k):  return _GenStub()
 
         class _ShimUnpickler(NumpyUnpickler):
             def find_class(self, module, name):
-                # Intercept NumPy pickle helpers (return factories)
                 if module == "numpy.random._pickle":
                     if name in {"__generator_ctor", "__randomstate_ctor", "__bit_generator_ctor"}:
                         return {"__generator_ctor": _noop_gen_ctor,
                                 "__randomstate_ctor": _noop_rs_ctor,
                                 "__bit_generator_ctor": _noop_bg_ctor}[name]
-                # Intercept classes themselves (return the stub class)
                 if (module, name) in {
                     ("numpy.random._generator", "Generator"),
                     ("numpy.random.mtrand", "RandomState"),
@@ -120,10 +113,7 @@ def _tmp_from_uploader(uploaded) -> str:
     return path
 
 def load_audio_any(path: str, target_sr: int, max_secs: int) -> Tuple[np.ndarray, int]:
-    """
-    Load mono audio at target_sr from audio or video containers.
-    Try librosa first; fallback to MoviePy/ffmpeg for tricky containers.
-    """
+    """Load mono audio at target_sr from audio or video containers."""
     try:
         y, sr = librosa.load(path, sr=target_sr, mono=True, duration=max_secs)
         return y, sr
@@ -205,7 +195,7 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
         feats[f"mfccs{i+1}m"]   = m
         feats[f"mfccs{i+1}std"] = s
 
-    # ΔMFCC 13 (our canonical name: "amfccs{i}")
+    # ΔMFCC 13 (canonical: "amfccs{i}")
     dmfcc = librosa.feature.delta(mfcc, order=1)
     for i in range(13):
         m, s = _safe_mean_std(dmfcc[i])
@@ -230,7 +220,7 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
 _PREFIX_RE = re.compile(r"^\d+-")
 def _strip_prefix(c: str) -> str: return _PREFIX_RE.sub("", c)
 
-# ---- Option B alias map: normalize ΔMFCC/core name variants to the extractor's keys ----
+# ---- Alias map: normalize ΔMFCC/core/chroma variants to extractor keys ----
 _DMFFC_ALIASES: Dict[str, str] = {}
 for i in range(1, 14):
     _DMFFC_ALIASES[f"delta_mfccs{i}m"]   = f"amfccs{i}m"
@@ -239,29 +229,70 @@ for i in range(1, 14):
     _DMFFC_ALIASES[f"dmfccs{i}std"]      = f"amfccs{i}std"
     _DMFFC_ALIASES[f"mfcc_delta{i}m"]    = f"amfccs{i}m"
     _DMFFC_ALIASES[f"mfcc_delta{i}std"]  = f"amfccs{i}std"
+    _DMFFC_ALIASES[f"amfcc_{i}m"]        = f"amfccs{i}m"
+    _DMFFC_ALIASES[f"amfcc_{i}std"]      = f"amfccs{i}std"
 
 _CORE_ALIASES = {
     "zcr": "zcrm",
     "energy": "energym",
     "spectralflux": "spectralfluxm",
+    "spectral_centroidm": "spectralcentroidm",
+    "spectral_spreadm": "spectralspreadm",
+    "spectral_rolloffm": "spectralrolloffm",
+    "energy_entropy_m": "energyentropym",
+    "energy_entropy_std": "energyentropystd",
+    "spectral_entropy_m": "spectralentropym",
+    "spectral_entropy_std": "spectralentropystd",
 }
+
+_CHROMA_ALIASES: Dict[str, str] = {}
+for i in range(1, 13):
+    _CHROMA_ALIASES[f"chroma_vector{i}m"]   = f"chromavector{i}m"
+    _CHROMA_ALIASES[f"chroma_vector{i}std"] = f"chromavector{i}std"
+    _CHROMA_ALIASES[f"chromavector_{i}m"]   = f"chromavector{i}m"
+    _CHROMA_ALIASES[f"chromavector_{i}std"] = f"chromavector{i}std"
+_CHROMA_ALIASES.update({
+    "chroma_deviationm": "chromadeviationm",
+    "chroma_deviationstd": "chromadeviationstd",
+})
+
+def _alias_key(key: str, feats: Dict[str, float]) -> Tuple[str, float]:
+    """Return (resolved_key, value) after trying aliases; NaN if nothing found."""
+    # direct
+    if key in feats and np.isfinite(feats[key]):
+        return key, feats[key]
+    # ΔMFCC
+    if key in _DMFFC_ALIASES:
+        k = _DMFFC_ALIASES[key]
+        if k in feats and np.isfinite(feats[k]): return k, feats[k]
+    # core
+    if key in _CORE_ALIASES:
+        k = _CORE_ALIASES[key]
+        if k in feats and np.isfinite(feats[k]): return k, feats[k]
+    # chroma
+    if key in _CHROMA_ALIASES:
+        k = _CHROMA_ALIASES[key]
+        if k in feats and np.isfinite(feats[k]): return k, feats[k]
+    return key, np.nan
 
 def align_features_for_model(feat_dict: Dict[str, float], model_cols: List[str]) -> pd.DataFrame:
     row = {}
     for col in model_cols:
-        key = _strip_prefix(col)  # drop numeric prefixes like "22-"
-        # direct hit
-        val = feat_dict.get(key, np.nan)
-
-        # aliasing for ΔMFCC / core variants
-        if not np.isfinite(val):
-            if key in _DMFFC_ALIASES and _DMFFC_ALIASES[key] in feat_dict:
-                val = feat_dict[_DMFFC_ALIASES[key]]
-            elif key in _CORE_ALIASES and _CORE_ALIASES[key] in feat_dict:
-                val = feat_dict[_CORE_ALIASES[key]]
-
+        key = _strip_prefix(col)
+        # exact or alias
+        if key in feat_dict and np.isfinite(feat_dict[key]):
+            val = feat_dict[key]
+        else:
+            _, val = _alias_key(key, feat_dict)
         row[col] = val
     return pd.DataFrame([row], columns=model_cols)
+
+def _group_of(col: str) -> str:
+    n = _strip_prefix(col).lower()
+    if n.startswith(("amfccs","mfcc_delta","delta_mfcc","dmfccs","amfcc_")): return "ΔMFCC"
+    if n.startswith(("mfccs",)) and not n.startswith(("amfccs",)):        return "MFCC"
+    if n.startswith(("chroma","chromavector","chroma_vector","chromadev")): return "Chroma"
+    return "core"
 
 def predict_one(path: str, model, encoder, sr: int, max_secs: int, model_cols: List[str], top_k: int):
     y, _ = load_audio_any(path, sr, max_secs)
@@ -279,7 +310,7 @@ def predict_one(path: str, model, encoder, sr: int, max_secs: int, model_cols: L
         top_labels = [str(encoder.inverse_transform([pred_idx])[0])]
         top_probs  = [1.0]
     pred_label = str(encoder.inverse_transform([pred_idx])[0])
-    return os.path.basename(path), pred_idx, pred_label, top_labels, top_probs, feats
+    return os.path.basename(path), pred_idx, pred_label, top_labels, top_probs, feats, X
 
 
 # ================= ZIP helper =================
@@ -295,7 +326,7 @@ def make_zip(rows: List[Tuple[str, str, bytes]]) -> bytes:
 
 # ================= UI =================
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • 92-col feature aliasing enabled (ΔMFCC/core name variants)")
+st.caption("Build 2025-08-18 • 92-col aliasing & alignment debugger (ΔMFCC/core/chroma variants)")
 st.write(f"🔎 Runtime — NumPy: **{np.__version__}**, joblib: **{joblib.__version__}**, pandas: **{pd.__version__}**")
 
 with st.sidebar:
@@ -310,6 +341,19 @@ with st.sidebar:
 model   = load_model(model_path)
 encoder = load_encoder(encoder_path)
 model_cols: List[str] = list(getattr(model, "feature_names_in_", []))
+
+# Model feature inventory (to see what it expects by group)
+with st.expander("📦 Model feature inventory"):
+    if model_cols:
+        counts = {"core":0, "MFCC":0, "ΔMFCC":0, "Chroma":0}
+        for c in model_cols:
+            counts[_group_of(c)] += 1
+        st.write(f"Total expected by model: **{len(model_cols)}**")
+        st.json(counts)
+        st.write("First 20 feature names (after numeric prefixes removed):")
+        st.write([_strip_prefix(c) for c in model_cols[:20]])
+    else:
+        st.write("Model has no feature_names_in_; alignment falls back to column order.")
 
 # Upload & predict
 st.subheader("Upload audio/video files")
@@ -329,14 +373,17 @@ if uploaded:
         file_bytes[p] = up.getvalue()
 
     rows = []
-    diag_groups = {"core": 0, "MFCC": 0, "ΔMFCC": 0, "Chroma": 0}
+    last_X = None
+    last_feats = None
 
     with st.spinner("Analyzing…"):
         for p in tmp_paths:
             try:
-                base, pred_idx, pred_label, top_labels, top_probs, feats = predict_one(
+                base, pred_idx, pred_label, top_labels, top_probs, feats, X = predict_one(
                     p, model, encoder, int(tgt_sr), int(max_secs), model_cols, int(top_k)
                 )
+                last_X = X
+                last_feats = feats
                 rows.append({
                     "file_name": base,
                     "pred_idx": pred_idx,
@@ -344,12 +391,6 @@ if uploaded:
                     "top_labels": ", ".join(top_labels),
                     "top_probs": ", ".join(f"{x:.6f}" for x in top_probs),
                 })
-                for k in feats:
-                    lk = k.lower()
-                    if lk.startswith(("zcr","energy","spectral")): diag_groups["core"] += 1
-                    elif lk.startswith("mfccs"): diag_groups["MFCC"] += 1
-                    elif lk.startswith("amfccs"): diag_groups["ΔMFCC"] += 1
-                    elif lk.startswith(("chroma","chromavector","chromadev")): diag_groups["Chroma"] += 1
             except Exception as e:
                 rows.append({
                     "file_name": os.path.basename(p),
@@ -359,29 +400,40 @@ if uploaded:
                     "top_probs": "",
                 })
 
-    # Diagnostics: check how many model columns we actually filled (non-NaN)
+    # Alignment diagnostics against the **aligned row** actually fed to the model
     with st.expander("📝 Diagnostics: feature alignment", expanded=True):
-        if model_cols:
+        if model_cols and last_X is not None:
+            mask = np.isfinite(last_X.iloc[0].to_numpy())
+            present = int(mask.sum())
             st.write(f"Expected features: {len(model_cols)}")
-            y, _ = load_audio_any(tmp_paths[-1], int(tgt_sr), int(max_secs))
-            last = extract_features(y, int(tgt_sr))
-            # Apply the same aliasing logic for the count
-            present = 0
-            for col in model_cols:
-                key = _strip_prefix(col)
-                val = last.get(key, np.nan)
-                if not np.isfinite(val):
-                    if key in _DMFFC_ALIASES and _DMFFC_ALIASES[key] in last:
-                        val = last[_DMFFC_ALIASES[key]]
-                    elif key in _CORE_ALIASES and _CORE_ALIASES[key] in last:
-                        val = last[_CORE_ALIASES[key]]
-                if np.isfinite(val):
-                    present += 1
             st.write(f"Present (non-NaN) in DF: {present}")
-            st.write("By group (non-NaN counts):")
-            st.json(diag_groups)
+
+            # Missing list (first 30) with suggested alias key & availability
+            missing_cols = [c for c, ok in zip(model_cols, mask) if not ok]
+            if missing_cols:
+                show = []
+                for c in missing_cols[:30]:
+                    key = _strip_prefix(c)
+                    alias, _ = _alias_key(key, last_feats or {})
+                    have_direct = key in (last_feats or {})
+                    have_alias  = alias in (last_feats or {}) and alias != key
+                    show.append({
+                        "model_col": c,
+                        "key": key,
+                        "alias_used": alias if have_alias else "",
+                        "direct_feat_found": bool(have_direct),
+                        "alias_feat_found": bool(have_alias),
+                    })
+                st.write("Missing columns (first 30) with alias probe:")
+                st.dataframe(pd.DataFrame(show), use_container_width=True, hide_index=True)
+            # Group breakdown based on model columns actually missing/present
+            by_group = {"core":0, "MFCC":0, "ΔMFCC":0, "Chroma":0}
+            for c, ok in zip(model_cols, mask):
+                if ok: by_group[_group_of(c)] += 1
+            st.write("By group (non-NaN counts from aligned row):")
+            st.json(by_group)
         else:
-            st.write("Model did not expose feature_names_in_; alignment assumed.")
+            st.write("No feature_names_in_ or no upload yet.")
 
     st.subheader("Predictions")
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
