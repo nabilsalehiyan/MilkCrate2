@@ -1,5 +1,5 @@
 # app.py — MilkCrate: drop audio/video → genre-organized ZIP
-# Build 2025-08-18 • robust unpickler intercepts NumPy RNG ctors/classes
+# Build 2025-08-18 • RNG-safe unpickler + 92-col feature aliasing (Option B)
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import librosa
 import soundfile as sf  # noqa: F401 (used by librosa)
 
 # ================= Defaults =================
+# Option B: keep the 92-feature model and align by aliasing ΔMFCC/etc.
 DEFAULT_MODEL_PATH   = "artifacts/model_version1beatport.joblib"
 DEFAULT_ENCODER_PATH = "artifacts/label_encoder.joblib"
 DEFAULT_SR           = 22050
@@ -68,25 +69,20 @@ def _safe_joblib_load(path: str):
             def random(self, *a, **k): return 0.5
             def randint(self, *a, **k): return 0
 
-        # No-op factories that return an *instance* immediately, so NumPy won't
-        # try to resolve real BitGenerators or call Generator(...)
-        def _noop_gen_ctor(*_a, **_k) -> _GenStub:
-            return _GenStub()
-        def _noop_rs_ctor(*_a, **_k) -> _GenStub:
-            return _GenStub()
-        def _noop_bg_ctor(*_a, **_k) -> _GenStub:
-            return _GenStub()
+        # No-op factories that return an *instance* immediately
+        def _noop_gen_ctor(*_a, **_k) -> _GenStub: return _GenStub()
+        def _noop_rs_ctor(*_a, **_k) -> _GenStub:  return _GenStub()
+        def _noop_bg_ctor(*_a, **_k) -> _GenStub:  return _GenStub()
 
         class _ShimUnpickler(NumpyUnpickler):
             def find_class(self, module, name):
-                # Intercept NumPy pickle helpers (return instances)
+                # Intercept NumPy pickle helpers (return factories)
                 if module == "numpy.random._pickle":
                     if name in {"__generator_ctor", "__randomstate_ctor", "__bit_generator_ctor"}:
                         return {"__generator_ctor": _noop_gen_ctor,
                                 "__randomstate_ctor": _noop_rs_ctor,
                                 "__bit_generator_ctor": _noop_bg_ctor}[name]
-                # Intercept classes themselves (return the stub *class* so calls like
-                # RandomState(...) / Generator(...) construct a stub instance)
+                # Intercept classes themselves (return the stub class)
                 if (module, name) in {
                     ("numpy.random._generator", "Generator"),
                     ("numpy.random.mtrand", "RandomState"),
@@ -209,7 +205,7 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
         feats[f"mfccs{i+1}m"]   = m
         feats[f"mfccs{i+1}std"] = s
 
-    # ΔMFCC 13
+    # ΔMFCC 13 (our canonical name: "amfccs{i}")
     dmfcc = librosa.feature.delta(mfcc, order=1)
     for i in range(13):
         m, s = _safe_mean_std(dmfcc[i])
@@ -234,8 +230,37 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
 _PREFIX_RE = re.compile(r"^\d+-")
 def _strip_prefix(c: str) -> str: return _PREFIX_RE.sub("", c)
 
+# ---- Option B alias map: normalize ΔMFCC/core name variants to the extractor's keys ----
+_DMFFC_ALIASES: Dict[str, str] = {}
+for i in range(1, 14):
+    _DMFFC_ALIASES[f"delta_mfccs{i}m"]   = f"amfccs{i}m"
+    _DMFFC_ALIASES[f"delta_mfccs{i}std"] = f"amfccs{i}std"
+    _DMFFC_ALIASES[f"dmfccs{i}m"]        = f"amfccs{i}m"
+    _DMFFC_ALIASES[f"dmfccs{i}std"]      = f"amfccs{i}std"
+    _DMFFC_ALIASES[f"mfcc_delta{i}m"]    = f"amfccs{i}m"
+    _DMFFC_ALIASES[f"mfcc_delta{i}std"]  = f"amfccs{i}std"
+
+_CORE_ALIASES = {
+    "zcr": "zcrm",
+    "energy": "energym",
+    "spectralflux": "spectralfluxm",
+}
+
 def align_features_for_model(feat_dict: Dict[str, float], model_cols: List[str]) -> pd.DataFrame:
-    row = {col: feat_dict.get(_strip_prefix(col), np.nan) for col in model_cols}
+    row = {}
+    for col in model_cols:
+        key = _strip_prefix(col)  # drop numeric prefixes like "22-"
+        # direct hit
+        val = feat_dict.get(key, np.nan)
+
+        # aliasing for ΔMFCC / core variants
+        if not np.isfinite(val):
+            if key in _DMFFC_ALIASES and _DMFFC_ALIASES[key] in feat_dict:
+                val = feat_dict[_DMFFC_ALIASES[key]]
+            elif key in _CORE_ALIASES and _CORE_ALIASES[key] in feat_dict:
+                val = feat_dict[_CORE_ALIASES[key]]
+
+        row[col] = val
     return pd.DataFrame([row], columns=model_cols)
 
 def predict_one(path: str, model, encoder, sr: int, max_secs: int, model_cols: List[str], top_k: int):
@@ -257,6 +282,7 @@ def predict_one(path: str, model, encoder, sr: int, max_secs: int, model_cols: L
     return os.path.basename(path), pred_idx, pred_label, top_labels, top_probs, feats
 
 
+# ================= ZIP helper =================
 def make_zip(rows: List[Tuple[str, str, bytes]]) -> bytes:
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -269,7 +295,7 @@ def make_zip(rows: List[Tuple[str, str, bytes]]) -> bytes:
 
 # ================= UI =================
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • RNG-safe unpickler intercepts numpy.random ctors/classes")
+st.caption("Build 2025-08-18 • 92-col feature aliasing enabled (ΔMFCC/core name variants)")
 st.write(f"🔎 Runtime — NumPy: **{np.__version__}**, joblib: **{joblib.__version__}**, pandas: **{pd.__version__}**")
 
 with st.sidebar:
@@ -333,12 +359,24 @@ if uploaded:
                     "top_probs": "",
                 })
 
+    # Diagnostics: check how many model columns we actually filled (non-NaN)
     with st.expander("📝 Diagnostics: feature alignment", expanded=True):
         if model_cols:
             st.write(f"Expected features: {len(model_cols)}")
             y, _ = load_audio_any(tmp_paths[-1], int(tgt_sr), int(max_secs))
             last = extract_features(y, int(tgt_sr))
-            present = sum(np.isfinite(last.get(re.sub(r'^\d+-','', c), np.nan)) for c in model_cols)
+            # Apply the same aliasing logic for the count
+            present = 0
+            for col in model_cols:
+                key = _strip_prefix(col)
+                val = last.get(key, np.nan)
+                if not np.isfinite(val):
+                    if key in _DMFFC_ALIASES and _DMFFC_ALIASES[key] in last:
+                        val = last[_DMFFC_ALIASES[key]]
+                    elif key in _CORE_ALIASES and _CORE_ALIASES[key] in last:
+                        val = last[_CORE_ALIASES[key]]
+                if np.isfinite(val):
+                    present += 1
             st.write(f"Present (non-NaN) in DF: {present}")
             st.write("By group (non-NaN counts):")
             st.json(diag_groups)
