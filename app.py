@@ -1,5 +1,10 @@
 # app.py — MilkCrate (audio/video → genre folders → ZIP)
-# Build: 2025-08-18 • beatport92-full-v3 (adds chromavector*/chromadeviation* mapping)
+# Build: 2025-08-18 • beatport201611_hgb | MFCC(1..13) + chromavector + chromadeviation + core features
+# - Accepts audio (wav/mp3/flac/ogg/opus/m4a/aac/wma/aiff) & video (mp4/m4v/mov/webm/mkv)
+# - Extracts features with names matching your model (mfccs*, chromavector*, chromadeviation*, core*)
+# - Aligns to model.feature_names_in_ order
+# - Predicts & organizes originals into genre folders; offers ZIP
+# - Includes NumPy RNG pickle shim for Streamlit Cloud compatibility
 
 import io, os, re, json, zipfile, unicodedata, warnings, tempfile
 from typing import Dict, List, Tuple
@@ -10,10 +15,10 @@ import pandas as pd
 import streamlit as st
 
 # decoding / features
-import soundfile as sf              # libsndfile (wav/flac/ogg/aiff)
-import librosa                      # decoding + features (uses audioread/ffmpeg)
-import audioread                    # backend for mp3/m4a/etc
-from moviepy.editor import AudioFileClip  # fallback for video containers
+import soundfile as sf              # wav/flac/ogg/aiff
+import librosa                      # decoding + features
+import audioread                    # mp3/m4a/etc backend
+from moviepy.editor import AudioFileClip  # video → audio
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="MilkCrate • Audio → Genre ZIP", layout="wide")
@@ -30,12 +35,36 @@ TOP_K_DEFAULT = 5
 SUPPORTED_AUDIO = {"wav","mp3","flac","ogg","oga","opus","m4a","aac","wma","aiff","aif","aifc"}
 SUPPORTED_VIDEO = {"mp4","m4v","mov","webm","mkv"}
 
+# ---------- NumPy RNG pickle compat ----------
+def _numpy_rng_pickle_shim():
+    """
+    Some models were saved when NumPy exposed RNG bit generators under private
+    modules like numpy.random._pcg64. On some hosts those modules don't exist,
+    breaking unpickling. This shim maps old names to current classes.
+    """
+    import sys, types, numpy as _np
+    npr = _np.random
+    mapping = {
+        "numpy.random._pcg64":   ("PCG64", "BitGenerator"),
+        "numpy.random._mt19937": ("MT19937", "BitGenerator"),
+        "numpy.random._philox":  ("Philox", "BitGenerator"),
+        "numpy.random._sfc64":   ("SFC64", "BitGenerator"),
+    }
+    for mod, names in mapping.items():
+        if mod not in sys.modules:
+            m = types.ModuleType(mod)
+            for name in names:
+                if hasattr(npr, name):
+                    setattr(m, name, getattr(npr, name))
+            sys.modules[mod] = m
+
 # ---------- Loaders ----------
 @st.cache_resource(show_spinner=False)
 def load_model(path: str):
     if not os.path.exists(path):
         st.error(f"Model not found: {path}")
         st.stop()
+    _numpy_rng_pickle_shim()
     return joblib.load(path)
 
 @st.cache_resource(show_spinner=False)
@@ -149,15 +178,14 @@ def split_base_and_stat(raw_name: str):
             return s[: -len(suf)], "s"
     return s, None
 
-# ---------- Row builder matching your exact names (incl. chromavector/ chromadeviation) ----------
+# ---------- Row builder matching your model's names ----------
 def build_feature_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[str, float]:
     """
-    Handles:
-      - zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff} + mean/std
-      - MFCC:      mfccs{1..20}{m|s|std|mean|sd} (your model uses 1..13)
-      - Chroma:    chromavector{1..12}{m|s|std} + chromadeviation{m|s|std}
-      - (Delta MFCCs are NOT present in your model, so not required.)
-    Unknown keys -> NaN (model imputer will handle extras, but we aim to fill all common ones).
+    Fills keys exactly as your model expects:
+      - Core: zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff} + mean/std
+      - MFCC: mfccs{1..20}{m|std} (your artifact uses 1..13)
+      - Chroma: chromavector{1..12}{m|std}, chromadeviation{m|std}
+    Anything else is left NaN (model's imputer will handle a few extras).
     """
     row: Dict[str, float] = {}
 
@@ -174,19 +202,19 @@ def build_feature_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[
     sflux = series_spec_flux(S)
     eent = series_energy_entropy(y, frame_len=n_fft, hop=hop, subframes=10)
 
-    # MFCCs (20; training uses first 13)
+    # MFCCs (compute 20; we'll use indices present in expected names)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)   # (20, T)
 
-    # Chroma vector (12) + deviation
+    # Chroma vector (12) + deviation across bins per frame
     chroma = librosa.feature.chroma_stft(S=S, sr=sr)     # (12, T)
-    chroma_dev = np.std(chroma, axis=0)                  # framewise deviation used by pyAudioAnalysis
+    chroma_dev_per_frame = np.std(chroma, axis=0)        # (T,)
 
     for key in expected_cols:
         # strip numeric prefix 'NN-'
         name = re.sub(r"^\d+-", "", key)
-        base, which = split_base_and_stat(name)
+        base, which = split_base_and_stat(name)  # which is 'm' or 's'
         out = np.nan
-        b = base  # normalized
+        b = base  # normalized string
 
         # ----- core groups -----
         if b == "zcr" and which:                          out = safe_stat(zcr, which)
@@ -200,13 +228,10 @@ def build_feature_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[
 
         else:
             s = b
-
             # MFCC index: mfccs{N}
             m_mf = re.match(r"mfccs(\d+)$", s)
-
             # Chroma vector: chromavector{N}
             m_cv = re.match(r"chromavector(\d+)$", s)
-
             # Chroma deviation: chromadeviation
             is_cdev = (s == "chromadeviation")
 
@@ -221,7 +246,7 @@ def build_feature_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[
                     out = safe_stat(chroma[j], which)
 
             elif is_cdev and which:
-                out = safe_stat(chroma_dev, which)
+                out = safe_stat(chroma_dev_per_frame, which)
 
         row[key] = float(out) if np.isfinite(out) else np.nan
 
@@ -295,7 +320,7 @@ def build_zip_by_genre(rows, preds_df: pd.DataFrame) -> bytes:
 
 # ---------- UI ----------
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • beatport92-full-v3 (chromavector/chromadeviation)")
+st.caption("Build 2025-08-18 • MFCC13 + chromavector + chromadeviation + core • RNG pickle shim")
 
 with st.sidebar:
     st.header("Settings")
@@ -393,7 +418,7 @@ if uploaded:
         )
 
         if preds["pred_label"].nunique(dropna=False) == 1 and present_any < len(expected_cols):
-            st.warning("All predictions are the same and many features are NaN. If this persists, share the Diagnostics numbers so we can refine parsing further.")
+            st.warning("All predictions are the same and many features are NaN. Share the Diagnostics numbers if this persists.")
     except Exception as e:
         st.error("Prediction failed.")
         st.exception(e)
