@@ -1,10 +1,5 @@
 # app.py — MilkCrate (audio/video → genre folders → ZIP)
-# Build: 2025-08-18 • beatport201611_hgb | MFCC(1..13) + chromavector + chromadeviation + core features
-# - Accepts audio (wav/mp3/flac/ogg/opus/m4a/aac/wma/aiff) & video (mp4/m4v/mov/webm/mkv)
-# - Extracts features with names matching your model (mfccs*, chromavector*, chromadeviation*, core*)
-# - Aligns to model.feature_names_in_ order
-# - Predicts & organizes originals into genre folders; offers ZIP
-# - Includes NumPy RNG pickle shim for Streamlit Cloud compatibility
+# Build: 2025-08-18 • MFCC13 + chromavector + chromadeviation + core • RNG pickle shim v2
 
 import io, os, re, json, zipfile, unicodedata, warnings, tempfile
 from typing import Dict, List, Tuple
@@ -35,15 +30,20 @@ TOP_K_DEFAULT = 5
 SUPPORTED_AUDIO = {"wav","mp3","flac","ogg","oga","opus","m4a","aac","wma","aiff","aif","aifc"}
 SUPPORTED_VIDEO = {"mp4","m4v","mov","webm","mkv"}
 
-# ---------- NumPy RNG pickle compat ----------
+# ---------- NumPy RNG pickle compat (strong shim) ----------
 def _numpy_rng_pickle_shim():
     """
-    Some models were saved when NumPy exposed RNG bit generators under private
-    modules like numpy.random._pcg64. On some hosts those modules don't exist,
-    breaking unpickling. This shim maps old names to current classes.
+    Some artifacts were saved when NumPy referenced private RNG modules
+    like numpy.random._pcg64. Newer builds may not recognize those paths
+    and raise: "<class 'numpy.random._pcg64.PCG64'> is not a known BitGenerator module".
+    This shim:
+      1) creates alias modules for old paths, and
+      2) patches numpy.random._pickle.__bit_generator_ctor to map legacy classes.
     """
     import sys, types, numpy as _np
     npr = _np.random
+
+    # 1) Provide legacy private modules with current classes
     mapping = {
         "numpy.random._pcg64":   ("PCG64", "BitGenerator"),
         "numpy.random._mt19937": ("MT19937", "BitGenerator"),
@@ -57,6 +57,25 @@ def _numpy_rng_pickle_shim():
                 if hasattr(npr, name):
                     setattr(m, name, getattr(npr, name))
             sys.modules[mod] = m
+
+    # 2) Patch constructor used during unpickling to accept legacy module names
+    try:
+        import numpy.random._pickle as nrp  # type: ignore[attr-defined]
+        orig_ctor = getattr(nrp, "__bit_generator_ctor", None)
+        if callable(orig_ctor):
+            def _compat_ctor(bitgen_cls):
+                # bitgen_cls can be a class; str(bitgen_cls) → "<class '...PCG64'>"
+                name = getattr(bitgen_cls, "__name__", None) or str(bitgen_cls)
+                if "PCG64" in name:   return npr.PCG64
+                if "MT19937" in name: return npr.MT19937
+                if "Philox" in name or "PHILOX" in name: return npr.Philox
+                if "SFC64" in name:   return npr.SFC64
+                # Fallback to NumPy's original behavior
+                return orig_ctor(bitgen_cls)
+            nrp.__bit_generator_ctor = _compat_ctor  # type: ignore[assignment]
+    except Exception:
+        # If patching fails, we still have the alias modules above.
+        pass
 
 # ---------- Loaders ----------
 @st.cache_resource(show_spinner=False)
@@ -183,9 +202,8 @@ def build_feature_row(y: np.ndarray, sr: int, expected_cols: List[str]) -> Dict[
     """
     Fills keys exactly as your model expects:
       - Core: zcr, energy, energyentropy, spectral{centroid,spread,entropy,flux,rolloff} + mean/std
-      - MFCC: mfccs{1..20}{m|std} (your artifact uses 1..13)
+      - MFCC: mfccs{1..20}{m|std} (artifact uses 1..13)
       - Chroma: chromavector{1..12}{m|std}, chromadeviation{m|std}
-    Anything else is left NaN (model's imputer will handle a few extras).
     """
     row: Dict[str, float] = {}
 
@@ -320,7 +338,7 @@ def build_zip_by_genre(rows, preds_df: pd.DataFrame) -> bytes:
 
 # ---------- UI ----------
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • MFCC13 + chromavector + chromadeviation + core • RNG pickle shim")
+st.caption("Build 2025-08-18 • MFCC13 + chromavector + chromadeviation + core • RNG pickle shim v2")
 
 with st.sidebar:
     st.header("Settings")
