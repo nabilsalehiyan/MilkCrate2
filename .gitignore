@@ -70,3 +70,6 @@ dataset1/
 !artifacts/label_encoder.joblib
 !artifacts/model_rf.joblib
 !artifacts/label_encoder.joblib
+artifacts/*.joblib
+!artifacts/model_rf.joblib
+!artifacts/label_encoder.joblib
