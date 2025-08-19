@@ -1,9 +1,8 @@
 # app.py — MilkCrate: drop audio/video → genre-organized ZIP
 # Build 2025-08-18
 # - RNG-safe unpickler for NumPy BitGenerator pickles
-# - 92-col feature set with aliasing
+# - 92-col feature set with aliasing (MFCC/ΔMFCC/Chroma/Core + BPM/Danceability + Beats loudness + Onset rate)
 # - Audio/video uploads, batch prediction, ZIP-by-genre export
-# - Beats loudness band ratios (24) + BPM/danceability/tempo histogram + beats_loudness.mean/std
 
 from __future__ import annotations
 
@@ -191,12 +190,10 @@ def _compute_beats_loudness_band_ratio(y: np.ndarray, sr: int, S_power: np.ndarr
     return feats
 
 def _compute_beats_loudness_stats(y: np.ndarray, sr: int, hop: int, n_frames: int) -> Dict[str, float]:
-    """Per-beat RMS → mean & std; names match Essentia style."""
     beats = _beat_boundaries(y, sr, hop, n_frames)
     if not beats:
         return {"beats_loudness.mean": float("nan"), "beats_loudness.stdev": float("nan")}
     n_fft = 2048
-    # frame-wise RMS to aggregate inside beats
     rms = librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop).squeeze()
     vals = []
     for s, e in beats:
@@ -208,15 +205,6 @@ def _compute_beats_loudness_stats(y: np.ndarray, sr: int, hop: int, n_frames: in
     return {"beats_loudness.mean": m, "beats_loudness.stdev": s}
 
 def _tempo_histogram_feats(y: np.ndarray, sr: int, hop: int) -> Dict[str, float]:
-    """
-    Approximations of Essentia-style tempo histogram features using librosa tempogram:
-      - bpm (1st peak bpm)
-      - bpmconf (normalized height of 1st peak)
-      - bpm_histogram_first_peak_bpm / _weight
-      - bpm_histogram_second_peak_bpm / _weight / _spread
-      - danceability (same as 1st-peak normalized weight)
-      - bpmessentia (alias target; we also map it back in alias table)
-    """
     oenv = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
     if oenv.size == 0:
         return {k: float("nan") for k in [
@@ -224,11 +212,10 @@ def _tempo_histogram_feats(y: np.ndarray, sr: int, hop: int) -> Dict[str, float]
             "bpm_histogram_second_peak_bpm", "bpm_histogram_second_peak_weight", "bpm_histogram_second_peak_spread",
             "danceability"
         ]}
-    tg = librosa.feature.tempogram(onset_envelope=oenv, sr=sr, hop_length=hop)  # shape: lags x frames
-    tg_mean = tg.mean(axis=1)  # aggregate over time
-    tempi = librosa.tempo_frequencies(tg_mean.shape[0], sr=sr, hop_length=hop)  # bpm grid
+    tg = librosa.feature.tempogram(onset_envelope=oenv, sr=sr, hop_length=hop)
+    tg_mean = tg.mean(axis=1)
+    tempi = librosa.tempo_frequencies(tg_mean.shape[0], sr=sr, hop_length=hop)
 
-    # Focus on 60..200 BPM (EDM-ish). If none, broaden.
     mask = (tempi >= 60) & (tempi <= 200)
     if not np.any(mask):
         mask = (tempi >= 30) & (tempi <= 240)
@@ -241,27 +228,16 @@ def _tempo_histogram_feats(y: np.ndarray, sr: int, hop: int) -> Dict[str, float]
             "danceability"
         ]}
 
-    # Normalize to [0,1]
     h_vals = np.maximum(h_vals, 0)
-    if float(h_vals.max()) > 0:
-        h_norm = h_vals / float(h_vals.max())
-    else:
-        h_norm = h_vals
+    h_norm = h_vals / float(h_vals.max()) if float(h_vals.max()) > 0 else h_vals
 
-    # Get top-2 peaks (by value)
     order = np.argsort(h_vals)[::-1]
-    i1 = int(order[0])
-    bpm1 = float(t_vals[i1])
-    w1 = float(h_norm[i1])
-
+    i1 = int(order[0]); bpm1 = float(t_vals[i1]); w1 = float(h_norm[i1])
     i2 = int(order[1]) if order.size > 1 else i1
-    bpm2 = float(t_vals[i2])
-    w2 = float(h_norm[i2])
+    bpm2 = float(t_vals[i2]); w2 = float(h_norm[i2])
 
-    # Local spread around 2nd peak: weighted std in ±3 bins
     lo = max(0, i2 - 3); hi = min(len(t_vals), i2 + 4)
-    t_win = t_vals[lo:hi]
-    w_win = h_norm[lo:hi]
+    t_win = t_vals[lo:hi]; w_win = h_norm[lo:hi]
     if w_win.sum() > 0:
         mu = np.sum(t_win * w_win) / np.sum(w_win)
         spread = float(np.sqrt(np.sum(w_win * (t_win - mu) ** 2) / np.sum(w_win)))
@@ -276,7 +252,7 @@ def _tempo_histogram_feats(y: np.ndarray, sr: int, hop: int) -> Dict[str, float]
         "bpm_histogram_second_peak_bpm": bpm2,
         "bpm_histogram_second_peak_weight": w2,
         "bpm_histogram_second_peak_spread": spread,
-        "danceability": w1,  # proxy: strength of dominant periodicity
+        "danceability": w1,
     }
 
 
@@ -345,6 +321,15 @@ def extract_features(y: np.ndarray, sr: int) -> Dict[str, float]:
     # --- beats loudness mean/std (Essentia-style names)
     feats.update(_compute_beats_loudness_stats(y, sr, hop, S.shape[1]))
 
+    # --- onset_rate (onsets per second)
+    try:
+        oenv = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+        on_frames = librosa.onset.onset_detect(onset_envelope=oenv, sr=sr, hop_length=hop, units="frames")
+        dur = len(y) / float(sr) if sr else 0.0
+        feats["onset_rate"] = float(len(on_frames) / dur) if dur > 0 else float("nan")
+    except Exception:
+        feats["onset_rate"] = float("nan")
+
     return feats
 
 
@@ -376,6 +361,7 @@ _CORE_ALIASES = {
     "energy_entropy_std": "energyentropystd",
     "spectral_entropy_m": "spectralentropym",
     "spectral_entropy_std": "spectralentropystd",
+    "onsetrate": "onset_rate",  # tolerate variant
 }
 
 # chroma aliases
@@ -398,7 +384,6 @@ _BPM_ALIASES = {
     "bpm_histogram_second_peak_bpm": "bpm_histogram_second_peak_bpm",
     "bpm_histogram_second_peak_weight": "bpm_histogram_second_peak_weight",
     "bpm_histogram_second_peak_spread": "bpm_histogram_second_peak_spread",
-    # tolerate typos/variants
     "bpmhistogramfirstpeakbpm": "bpm_histogram_first_peak_bpm",
     "bpmhistogramfirstpeakweight": "bpm_histogram_first_peak_weight",
     "bpmhistogramsecondpeakbpm": "bpm_histogram_second_peak_bpm",
@@ -468,7 +453,7 @@ def make_zip(rows: List[Tuple[str, str, bytes]]) -> bytes:
 
 # ================= UI =================
 st.title("🎛️ MilkCrate — Drop audio/video → genre-organized ZIP")
-st.caption("Build 2025-08-18 • MFCC13 + ΔMFCC13 + chroma + core + beats-loudness ratios + BPM/danceability • RNG pickle shim")
+st.caption("Build 2025-08-18 • MFCC13 + ΔMFCC13 + chroma + core + beats-loudness ratios + BPM/danceability + onset_rate • RNG pickle shim")
 st.write(f"🔎 Runtime — NumPy: **{np.__version__}**, joblib: **{joblib.__version__}**, pandas: **{pd.__version__}**")
 
 with st.sidebar:
