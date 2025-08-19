@@ -66,3 +66,5 @@ cached_*.npy
 *.npy
 *.tsv
 dataset1/
+!artifacts/model_rf.joblib
+!artifacts/label_encoder.joblib
